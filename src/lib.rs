@@ -110,7 +110,7 @@ pub struct HybridGiConfig {
     pub probe_spacing: u32,
     /// 4 or 8; squared directions per refreshed probe. Default: 64, as in GI-1.2.
     pub probe_directions: u32,
-    /// Reserve a second probe for tiles containing incompatible surfaces.
+    /// Reserve a second surface probe in compensated mode. SourceAtlas uses one.
     pub adaptive_probes: bool,
     /// Power of two, 1024..=262144 entries per camera.
     pub cache_capacity: u32,

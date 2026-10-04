@@ -89,20 +89,24 @@ Bevy's preconvolved `EnvironmentMapLight` images. GI does not draw the skybox.
 
 ## Implemented
 
-- Jittered screen probes with an adaptive second surface per tile, validated
-  reprojection, and screen-continuity checks at visible geometry breaks.
+- Source single-layer screen-probe atlas with whole-tile best-seed reprojection,
+  fixed-budget empty/override patching and separate fresh/active compaction.
+  Compensated mode optionally reserves a second surface per tile.
 - Persistent cached probes with projected candidates, shared restoration,
   exclusive update ownership, parallel reservations and stable LRU/MRU compaction.
-- Full/quarter/sixteenth refresh, immediate disocclusion tracing and retained seeds.
+- Full/quarter/sixteenth Halton spawn regions, disocclusion query redistribution
+  and retained compatible seeds, including pose-only scene updates.
 - Equal-area hemi-octahedral directions with material-weighted bounded GGX and
-  cosine/radiance guidance, a shared-memory CDF and mixture-PDF compensation;
-  half-packed RGB/hit distance and merged cached-neighbor directional history.
+  radiance guidance and a shared-memory CDF; source atlas sampling uses the full
+  Fresnel probability, with mixture-PDF compensation reserved for compensated mode.
+  Half-packed RGB/hit distance and integer fixed-point directional history reuse.
 - Probe-mask mip hierarchy and horizontal/vertical directional filtering with
   reconnected endpoint-angle and depth rejection, feeding rough reflection reuse.
 - Source shadow-preserving directional hysteresis, blue-noise interpolation
   jitter and low-confidence relaxed interpolation when every probe weight fails.
-- Raw cubemap lighting for probe misses, diffuse next-event samples, secondary
-  hit shading and glossy misses; rotation and mip-hierarchy importance sampling.
+- Raw cubemap lighting for misses and a virtual environment light integrated into
+  source streamed RIS/ReSTIR; oriented grid weights, ray-cone LOD, rotation and
+  mip-hierarchy importance sampling.
 - Source atlas-cell SH projection after directional filtering, with signed half
   packing, source normalization and energy-spread backup for untraced cells.
   `ProbeProjection::CompensatedRayIntegral` retains PDF-compensated projection
@@ -112,7 +116,8 @@ Bevy's preconvolved `EnvironmentMapLight` images. GI does not draw the skybox.
 - Directional hash-cache tiles with PCG/xxHash descriptors, distance/FOV-based
   sizing, 8x8/4x4/2x2/1x1 mips, half-float storage, atomic accumulation and expiry;
   an auxiliary cache retains full material/normal/plane checks and miss fallback.
-- Separate direct/indirect estimators and explicit extra diffuse-bounce rays,
+- Separate direct/indirect estimators and extra cosine-sampled bounce rays with
+  source full matte BRDF/PDF evaluation and discarded-ray survival compensation,
   using current direct light at secondary cells without recursive cache feedback.
 - Shadowed emissive triangles, directional, point, and spot lights, sampled from
   a weighted alias table with the correct marginal selection probability.
@@ -207,18 +212,18 @@ Defaults use four next-event light samples and adaptive separable diffuse denois
 `rough_reflection_threshold` controls when probe reuse starts (default 0.2);
 `reflection.high_roughness_threshold` sets the end of the transition (default 0.6).
 Reflection reconstruction has its own configuration and four à-trous passes by default.
-`adaptive_probes = false` releases the second layer's allocation. The ray capacity
-is fixed; compacted dispatches trace only valid slots. Extra surfaces beyond two
-still use the per-pixel fallback. The Cornell example also enables FXAA.
+SourceAtlas allocates one probe per tile. In compensated mode,
+`adaptive_probes = false` releases the optional second layer. Ray capacity is fixed;
+compacted dispatches trace only valid slots. Unrepresented surfaces use the
+per-pixel fallback. The Cornell example also enables FXAA.
 
-At 640x640, defaults reserve 12,800 probes, 6,400 cached probes, and 819,200 probe-ray records. GPU storage
-is approximately 1.185 GB per camera, excluding Bevy's own targets and scene buffers.
-Enabling world-space reservoir reuse adds approximately 238 MB at that resolution.
+At 640x640, defaults reserve 6,400 probes, 6,400 cached probes, and 409,600 probe-ray
+records. Enabling world-space reservoir reuse adds approximately 170 MB at that resolution.
 `WorldSpaceRestirConfig` controls its table capacity and distance/FOV footprint.
 Bevy's render-world `MainPassResolutionOverride` is supported; GI allocations,
 jitter, composition, feedback and cache footprints use the main-pass dimensions.
-The source-sized directional hash cache accounts for approximately 899 MB of this.
-A 1080p view uses approximately 2.401 GB; 4K can exceed storage-buffer limits.
+The source-sized directional hash cache alone reserves approximately 899 MB per camera,
+in addition to probe, reflection, history and scene buffers. 4K can exceed storage-buffer limits.
 Reduce `hash_grid.num_buckets` for smaller caches, use coarser probe spacing, or
 lower the render resolution if allocation is rejected.
 
@@ -232,15 +237,15 @@ is approximate and can blur detail or leak light despite surface rejection.
 Reflection reconstruction can blur sharp reflections and retain temporal artifacts.
 Render-world `MainPassResolutionOverride` resizes GI composition and histories.
 
-The remaining upstream differences include probe atlas relocation/patch scheduling,
-source visibility-ID/renderer alignment, environment-light integration into the
-streamed RIS grid, and exact animated-surface history handling.
+The remaining upstream differences include persistent probe eviction/update ownership,
+source visibility-ID/renderer alignment, source random seed buffers, short-ray
+multibounce bypass integration, and exact animated-surface history handling.
 Implemented hash-cache, grid and reflection stages still have differences in
 representation, sampling and scheduling. [The parity inventory](docs/gi12-parity.md) tracks
 these explicitly; this remains an incomplete port.
 Moving geometry performs synchronous CPU deformation/refitting, rebuilds the
-hardware scene, and resets world/probe caches while motion vectors preserve
-compatible pixel histories. Correct animated geometry is
+hardware scene, and resets world/persistent-probe caches while motion vectors preserve
+compatible pixel and screen-probe histories. Correct animated geometry is
 tested; stable temporal lighting and large animated scenes still need further work.
 The historical Radiance
 Cascades assessment remains in [techniques.md](docs/techniques.md).

@@ -7,8 +7,8 @@ void seed_restir_scan(uint3 gid:SV_DispatchThreadID) {
 }
 [shader("compute")][numthreads(64,1,1)]
 void read_restir_scan(uint3 gid:SV_DispatchThreadID) {
-    let index=gid.x;if(index>=restir_entries()) {return;}
-    restir_checks[index]=restir[restir_table(false)+2u*restir_entries()+index].load();
+    let index=gid.x;let entry=index*max(p.screen.x,1u);if(entry>=restir_entries()) {return;}
+    restir_checks[index]=restir[restir_table(false)+2u*restir_entries()+entry].load();
 }
 [shader("compute")][numthreads(64,1,1)]
 void insert_restir_checks(uint3 gid:SV_DispatchThreadID) {

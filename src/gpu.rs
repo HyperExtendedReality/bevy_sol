@@ -41,8 +41,8 @@ fn texture_features() -> WgpuFeatures {
 const CACHE_BYTES: u64 = 224;
 const RAY_BYTES: u64 = 144;
 const WORK_HEADER: u64 = 32;
-const BASE_STAGES: usize = 88;
-const STAGES: [&str; 92] = [
+const BASE_STAGES: usize = 95;
+const STAGES: [&str; 99] = [
     "compute_brdf_lut",
     "reset_work",
     "clear_light_grid_bounds",
@@ -51,6 +51,13 @@ const STAGES: [&str; 92] = [
     "clear_restir",
     "prepare_probe_cache",
     "project_probe_cache",
+    "reproject_screen_probes",
+    "reproject_probe_history",
+    "snapshot_reprojected_probes",
+    "schedule_screen_probes",
+    "patch_screen_probes",
+    "commit_screen_probes",
+    "compact_screen_probes",
     "spawn_probes",
     "filter_probe_mask_1",
     "filter_probe_mask_2",
@@ -204,6 +211,7 @@ fn compile_shader(
                     format!("PROBE_DIRECTIONS={}", directions.pow(2)),
                     format!("GI_HARDWARE={}", u32::from(hardware)),
                     format!("GI_TEXTURED={}", u32::from(textured)),
+                    "GI_GRID_ENVIRONMENT=1".into(),
                 ],
                 ..default()
             },
@@ -979,10 +987,13 @@ fn allocate_view(device: &RenderDevice, size: UVec2, settings: &GiSettings) -> O
         size.x.div_ceil(c.probe_spacing),
         size.y.div_ceil(c.probe_spacing),
     );
-    let probes_count = tiles
-        .x
-        .checked_mul(tiles.y)?
-        .checked_mul(if c.adaptive_probes { 2 } else { 1 })?;
+    let probes_count = tiles.x.checked_mul(tiles.y)?.checked_mul(
+        if c.adaptive_probes && c.probe_projection != crate::ProbeProjection::SourceAtlas {
+            2
+        } else {
+            1
+        },
+    )?;
     let rays_count = probes_count.checked_mul(c.probe_directions.pow(2))?;
     let cached_probes = u64::from(tiles.x) * u64::from(tiles.y);
     let limits = device.limits();
@@ -997,13 +1008,15 @@ fn allocate_view(device: &RenderDevice, size: UVec2, settings: &GiSettings) -> O
             + 20
             + 5 * cached_probes
             + cached_probes.div_ceil(128)
-            + u64::from(probes_count))
+            + u64::from(probes_count)
+            + 4
+            + 3 * cached_probes)
             * 4,
         c.hash_grid.bytes(),
         c.reflection.bytes(size),
         c.light_grid.bytes(),
         cached_probes * (16 + probe_bytes(c.probe_directions)),
-        (u64::from(probes_count) + cached_probes) * probe_bytes(c.probe_directions),
+        (u64::from(probes_count) + 2 * cached_probes) * probe_bytes(c.probe_directions),
         if c.reservoir_resampling {
             c.world_space_restir.bytes(rays_count)
         } else {
@@ -1684,8 +1697,24 @@ fn dispatch(
         let reflection = &settings.0.reflection;
         let stage = STAGES[index];
         let parallel_grid = settings.0.light_grid.parallel_build
-            && state.params.get().scene_info.y > 128 * settings.0.light_grid.reservoirs_per_cell;
+            && state.params.get().scene_info.y
+                + u32::from(
+                    settings.0.probe_projection == crate::ProbeProjection::SourceAtlas
+                        && (state.params.get().environment.x > 0.0
+                            || state.params.get().sky.truncate().max_element() > 0.0),
+                )
+                > 128 * settings.0.light_grid.reservoirs_per_cell;
         let enabled = match stage {
+            "reproject_screen_probes"
+            | "reproject_probe_history"
+            | "snapshot_reprojected_probes"
+            | "schedule_screen_probes"
+            | "patch_screen_probes"
+            | "commit_screen_probes"
+            | "compact_screen_probes" => {
+                settings.0.probe_projection == crate::ProbeProjection::SourceAtlas
+            }
+            "spawn_probes" => settings.0.probe_projection != crate::ProbeProjection::SourceAtlas,
             "project_probe_atlas" => {
                 settings.0.probe_projection == crate::ProbeProjection::SourceAtlas
             }
@@ -1819,7 +1848,15 @@ fn dispatch(
                     let groups = (state.tiles.x * state.tiles.y).div_ceil(128);
                     (groups.min(65535), groups.div_ceil(65535), 1)
                 }
-                "spawn_probes" => linear(state.probes_count),
+                "reproject_probe_history" => {
+                    linear(state.tiles.x * state.tiles.y * settings.0.probe_directions.pow(2))
+                }
+                "spawn_probes" | "reproject_screen_probes" => linear(state.probes_count),
+                "snapshot_reprojected_probes"
+                | "schedule_screen_probes"
+                | "patch_screen_probes"
+                | "commit_screen_probes"
+                | "compact_screen_probes" => linear(state.tiles.x * state.tiles.y),
                 _ => pixels,
             };
             pass.dispatch_workgroups(x, y, z);

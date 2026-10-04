@@ -208,6 +208,17 @@ float3 bounce_albedo(float3 position, uint triangle) {
     let reflectance = geometry[triangle + 12u].y;
     return clamp(base * (1.0 - 0.16 * reflectance * reflectance), float3(0.0), float3(0.99));
 }
+float4 multibounce_brdf(float3 base, float reflectance, float3 normal, float3 view, float3 direction) {
+    let f0 = float3(0.16 * reflectance * reflectance);
+    let half_vector = normalize(view + direction); let cosine = max(dot(normal, direction), 0.0);
+    let value = cosine * (base * diffuse_compensation(f0, dot(half_vector, view)) / PI
+        + specular_brdf(normal, view, direction, f0, 1.0));
+    return float4(value, cosine / PI);
+}
+float3 multibounce_radiance(float3 incoming, float4 brdf, float discard_probability) {
+    if (brdf.w <= 0.0 || discard_probability >= 1.0) { return float3(0.0); }
+    return incoming * brdf.rgb / (brdf.w * (1.0 - discard_probability));
+}
 float3 directional_direct_radiance(float3 position, float3 n, float3 view, uint triangle, uint seed, uint reservoir_slot) {
     let bary = barycentrics(position, triangle); let indices = geometry[triangle + 11u]; let properties = geometry[triangle + 12u];
     let base = geometry[triangle + 13u].rgb * material_texture(uint(indices.x), triangle_uv(triangle, bary, 0u)).rgb;
@@ -217,7 +228,7 @@ float3 directional_direct_radiance(float3 position, float3 n, float3 view, uint 
     let f0 = lerp(float3(0.16 * properties.y * properties.y), base, metallic);
     let origin = offset_origin(position, triangle, n);
     var light = Lighting(float3(0.0), float3(0.0)); var used_reservoir = false;
-    if (p.scene_info.y > 0u) {
+    if (grid_light_count() > 0u) {
         var info = uint4(MISSING,0u,0u,p.frame.x); var reservoir = float4(0.0);
         if (p.quality.y != 0.0 && reservoir_slot != MISSING) {
             let stored=restir_load_reservoir(reservoir_slot,false);
@@ -230,7 +241,7 @@ float3 directional_direct_radiance(float3 position, float3 n, float3 view, uint 
                 reservoir = float4(fresh.uv,fresh.weight_sum/(float(fresh.count)*fresh.target_density),fresh.target_density);
             }
         }
-        if (info.x < p.scene_info.y && info.z > 0u && info.w == p.frame.x) {
+        if (info.x < grid_light_count() && info.z > 0u && info.w == p.frame.x) {
             // The RIS normalization is from the source location; evaluate the
             // selected light and its visibility at this actual visibility hit.
             used_reservoir = true;
@@ -248,9 +259,10 @@ float3 directional_direct_radiance(float3 position, float3 n, float3 view, uint 
             }
         }
     }
-    if (!used_reservoir) { light = light_transport(position, n, origin, seed, false, f0, view, roughness); }
-    var value = base * light.diffuse + bounce_albedo(position, triangle) * sky_irradiance(n, origin, seed) + light.specular;
-    if (has_environment()) {
+    if (!used_reservoir && !source_probe_projection()) { light = light_transport(position, n, origin, seed, false, f0, view, roughness); }
+    var value = base * light.diffuse + light.specular;
+    if(!grid_environment_enabled()) {value+=bounce_albedo(position, triangle) * sky_irradiance(n, origin, seed);}
+    if (has_environment() && !grid_environment_enabled()) {
         let surface_value = Surface(position, n, base, roughness, metallic, properties.y, 1.0, true);
         let sample_value = sample_specular_view(surface_value, seed + 47u, view);
         if (any(sample_value.weight > float3(0.0))) {
@@ -269,8 +281,18 @@ void trace_hash_bounces(uint3 gid : SV_DispatchThreadID) {
     let ray = rays[index];
     if (p.options.y == 0u || ray.info.w == MISSING || ray.info.y == MISSING || all(ray.normal.xyz == float3(0.0))) { return; }
     var rng = hash32(index ^ hash32(p.frame.x + 179u));
-    if (random(rng) <= p.hash_sampling.z) { return; }
-    let direction = cosine_ray(ray.normal.xyz, float2(random(rng), random(rng)));
+    let source = source_probe_projection();
+    var discard_sample: float;
+    if (source) { discard_sample = grid_random(rng); } else { discard_sample = random(rng); }
+    if (discard_sample <= p.hash_sampling.z) { return; }
+    var direction: float3;
+    if (source) {
+        let uv = float2(grid_random(rng), grid_random(rng));
+        let radius = sqrt(uv.x); let phi = 2.0 * PI * uv.y;
+        let rotation = ggx_rotation_to_z(ray.normal.xyz);
+        direction = normalize(ggx_rotate(float4(-rotation.xyz, rotation.w),
+            float3(radius * cos(phi), radius * sin(phi), sqrt(1.0 - uv.x))));
+    } else { direction = cosine_ray(ray.normal.xyz, float2(random(rng), random(rng))); }
     let origin = offset_origin(ray.position.xyz, ray.info.y, direction);
     let hit = trace(origin, direction, p.cache_config.w); if (hit.triangle == MISSING) { return; }
     let n = hit_normal(hit, direction); if (all(n == float3(0.0))) { return; }
@@ -280,6 +302,13 @@ void trace_hash_bounces(uint3 gid : SV_DispatchThreadID) {
     rays[index].bounce_position = float4(position, hit.distance);
     rays[index].bounce_normal = float4(n, 0.0); rays[index].bounce_direction = float4(direction, 0.0);
     rays[index].bounce_info = uint4(cell, hit.triangle, 1u, cache_insert(position, n, hit.distance, hit.triangle, false));
+    if (source) {
+        let triangle = ray.info.y; let bary = barycentrics(ray.position.xyz, triangle);
+        let base = geometry[triangle + 13u].rgb * material_texture(uint(geometry[triangle + 11u].x), triangle_uv(triangle, bary, 0u)).rgb;
+        let brdf = multibounce_brdf(base, geometry[triangle + 12u].y, ray.normal.xyz, -ray.direction.xyz, direction);
+        rays[index].bounce_info.z = pack2x16float(brdf.xy);
+        rays[index].bounce_info.w = pack2x16float(brdf.zw);
+    }
 }
 [shader("compute")][numthreads(64,1,1)]
 void populate_hash_bounces(uint3 gid : SV_DispatchThreadID) {
@@ -299,6 +328,9 @@ void resolve_hash_bounces(uint3 gid : SV_DispatchThreadID) {
     if (ray.bounce_info.x == MISSING) { return; }
     let direct = hash_filtered(ray.bounce_info.x, false);
     let incoming = direct.rgb / max(direct.w, 1.0);
-    hash_accumulate(ray.info.w, bounce_albedo(ray.position.xyz, ray.info.y) * incoming, true);
+    let value = select(source_probe_projection(),
+        multibounce_radiance(incoming, float4(unpack2x16float(ray.bounce_info.z), unpack2x16float(ray.bounce_info.w)), p.hash_sampling.z),
+        bounce_albedo(ray.position.xyz, ray.info.y) * incoming);
+    hash_accumulate(ray.info.w, value, true);
 }
 

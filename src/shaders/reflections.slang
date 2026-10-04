@@ -272,11 +272,12 @@ void reflection_atrous_last(uint3 gid : SV_DispatchThreadID) {
 void reflection_split(uint2 pixel, bool vertical) {
     let s=surface(pixel); let radius=int(p.reflection_filter.x); let half_radius=(radius+int(p.reflection.x)-1)/int(p.reflection.x);
     let n=reflection_geometric_normal(pixel,s); var sum=float4(0.0);var second=float3(0.0);var total=0.0;
+    let jitter=int2(floor((reflection_blue_noise(pixel,p.frame.x,0u)-0.5)*2.0+0.5));
     if (s.valid && s.roughness<=p.reflection_filter.w && p.options.w!=0u) {
         for (var i=-half_radius;i<=half_radius;i++) {
-            var tap=int2(pixel/p.reflection.x)+int2(i,0); if (vertical) { tap=int2(pixel/p.reflection.x)+int2(0,i); }
+            var tap=int2(pixel/p.reflection.x)+int2(i,0); if (vertical) { tap=int2(pixel/p.reflection.x)+int2(jitter.x,i); }
             if (any(tap<int2(0)) || any(tap>=int2(reflection_size()))) { continue; }
-            let q=uint2(tap);var full=reflection_full_pixel(q);if (vertical) { full.x=pixel.x; }
+            let q=uint2(tap);let full=reflection_full_pixel(q);
             if (any(full>=p.viewport.zw)) {continue;}
             let other=surface(full);if (!other.valid || other.roughness>p.reflection_filter.w) {continue;}
             let endpoint=reflections[reflection_sample_index(1u,q)];
@@ -284,8 +285,22 @@ void reflection_split(uint2 pixel, bool vertical) {
             let gaussian=exp(-float(delta*delta)/(2.0*pow(0.375*float(radius),2.0)));
             let weight=gaussian*reflection_plane_weight(s,other,n)*reflection_pdf(s,endpoint);
             var value=reflections[reflection_sample_index(2u,q)]; var squared=value.rgb*value.rgb;
-            if (vertical) { let split=uint2(pixel.x,q.y); value=reflections[reflection_split_index(0u,split)];squared=pow(reflections[reflection_split_index(1u,split)].rgb,float3(2.0)); }
+            if (vertical) { let split=uint2(full.x,q.y); value=reflections[reflection_split_index(0u,split)];squared=pow(reflections[reflection_split_index(1u,split)].rgb,float3(2.0)); }
             sum+=value*weight;second+=squared*weight;total+=weight;
+        }
+        if(total<1e-3) {
+            // ResolveReflections_SplitRatioEstimatorX/Y retries three taps with
+            // unit weights when plane/PDF rejection leaves an upsampling hole.
+            sum=float4(0.0);second=float3(0.0);total=0.0;
+            for(var i=-1;i<=1;i++) {
+                let tap=int2(pixel/p.reflection.x)+select(vertical,int2(0,i),int2(i,0));
+                if(any(tap<int2(0))||any(tap>=int2(reflection_size()))) {continue;}
+                let q=uint2(tap);let full=reflection_full_pixel(q);if(any(full>=p.viewport.zw)) {continue;}
+                let other=surface(full);if(!other.valid||other.roughness>p.reflection_filter.w) {continue;}
+                var value=reflections[reflection_sample_index(2u,q)];var squared=value.rgb*value.rgb;
+                if(vertical) {let split=uint2(full.x,q.y);value=reflections[reflection_split_index(0u,split)];squared=pow(reflections[reflection_split_index(1u,split)].rgb,float3(2.0));}
+                sum+=value;second+=squared;total+=1.0;
+            }
         }
     }
     if (total>1e-3) {sum/=total;second/=total;}

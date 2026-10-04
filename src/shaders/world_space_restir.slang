@@ -106,7 +106,7 @@ void restir_generate(uint index,bool bounce) {
     if(!bounce && ray.info.x==EMISSIVE_PROBE_RAY) {return;}
     let position=select(bounce,ray.bounce_position.xyz,ray.position.xyz);
     let normal=select(bounce,ray.bounce_normal.xyz,ray.normal.xyz);
-    if(info.y==MISSING||all(normal==float3(0.0))||p.scene_info.y==0u|| (bounce&&info.x==MISSING)) {return;}
+    if(info.y==MISSING||all(normal==float3(0.0))||grid_light_count()==0u|| (bounce&&info.x==MISSING)) {return;}
     let origin=select(bounce,ray.position.xyz,probes[index/PROBE_DIRECTIONS].position.xyz);
     let view=normalize(origin-position);var rng=pcg_hash(sample+p.frame.x);
     let fresh=grid_fresh_reservoir(position,normal,view,info.y,rng);
@@ -144,10 +144,20 @@ void scan_restir_counts(uint3 group:SV_GroupID,uint lane:SV_GroupIndex) {
     if(entry<restir_entries()) {restir[table+2u*restir_entries()+entry].store(select(lane>0u,restir_prefix[max(lane,1u)-1u],0u));}
     if(lane==127u) {restir[restir_scan()+block].store(restir_prefix[lane]);}
 }
-[shader("compute")][numthreads(1,1,1)]
-void scan_restir_blocks() {
-    var prefix=0u;
-    for(var block=0u;block<restir_blocks();block++) {
+[shader("compute")][numthreads(128,1,1)]
+void scan_restir_blocks(uint lane:SV_GroupIndex) {
+    // Parallel scan of contiguous segments, then add each segment's exclusive
+    // offset. No single invocation walks the upstream table's 32768 blocks.
+    let span=(restir_blocks()+127u)/128u;let begin=lane*span;let end=min(begin+span,restir_blocks());
+    var total=0u;
+    for(var block=begin;block<end;block++) {total+=restir[restir_scan()+block].load();}
+    restir_prefix[lane]=total;GroupMemoryBarrierWithGroupSync();
+    for(var step=1u;step<128u;step<<=1u) {
+        var add=0u;if(lane>=step) {add=restir_prefix[lane-step];}
+        GroupMemoryBarrierWithGroupSync();restir_prefix[lane]+=add;GroupMemoryBarrierWithGroupSync();
+    }
+    var prefix=0u;if(lane>0u) {prefix=restir_prefix[lane-1u];}
+    for(var block=begin;block<end;block++) {
         let count=restir[restir_scan()+block].load();restir[restir_scan()+block].store(prefix);prefix+=count;
     }
 }
@@ -165,7 +175,7 @@ void compact_restir(uint3 gid:SV_DispatchThreadID) {
     restir[restir_values(false)+offset+ordinal].store(sample);
 }
 float restir_target(float3 position,float3 normal,float3 view,uint material,PackedReservoir r) {
-    if(r.light>=p.scene_info.y) {return 0.0;}
+    if(r.light>=grid_light_count()) {return 0.0;}
     let selected=evaluate_light_cone(position,normal,r.light,r.uv,4.0*PI/(8.0*12000.0));let base=restir_material_base(material);let f0=float3(0.04);
     let half_vector=normalize(view+selected.direction);let lut=sample_brdf_lut(clamp(dot(normal,view),0.0,1.0),1.0);
     let albedo=luminance(base)+luminance(clamp(f0*lut.x+(float3(1.0)-f0)*lut.y,float3(0.0),float3(1.0)));
@@ -179,7 +189,7 @@ void restir_merge(inout PackedReservoir result,inout float target,PackedReservoi
     result.weight=total/max(target,1e-30);result.count+=candidate.count;
 }
 void restir_resample(uint sample) {
-    var result=restir_load_reservoir(sample,false);if(result.count<=0.0||result.light>=p.scene_info.y) {return;}
+    var result=restir_load_reservoir(sample,false);if(result.count<=0.0||result.light>=grid_light_count()) {return;}
     let address=restir_samples()+4u*sample;
     let ox=unpack2x16float(restir[address].load());let oz=unpack2x16float(restir[address+1u].load());
     let wx=unpack2x16float(restir[address+2u].load());let wz=unpack2x16float(restir[address+3u].load());
@@ -194,7 +204,7 @@ void restir_resample(uint sample) {
     for(var i=0u;i<count;i+=increment) {
         let sample2=restir[restir_values(true)+index+((i+offset)%count)].load();
         var other=restir_load_reservoir(sample2,true);
-        if(other.count<=0.0||other.light>=p.scene_info.y||!(other.weight<1e30)) {continue;}
+        if(other.count<=0.0||other.light>=grid_light_count()||!(other.weight<1e30)) {continue;}
         let filter_normal=restir_unpack_normal(restir[restir_normals(true)+sample2].load());
         if(pow(max(dot(normal,filter_normal),0.0),4.0)<0.5) {continue;}
         other.count=min(other.count,20.0);let shifted=restir_target(world,normal,view,material,other);

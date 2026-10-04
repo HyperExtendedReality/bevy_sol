@@ -316,6 +316,13 @@ float3 area_light_position(float3 a,float3 b,float3 c,float2 bary) {
     return a*(1.0-bary.x-bary.y)+b*bary.x+c*bary.y;
 }
 LightSample evaluate_light_cone(float3 position,float3 n,uint light_index,float2 uv,float solid_angle) {
+#if GI_GRID_ENVIRONMENT
+    if(grid_environment_light(light_index)) {
+        let sampled=sample_environment(n,uv);let cosine=max(dot(n,sampled.xyz),0.0);
+        let value=environment_radiance_cone(sampled.xyz,solid_angle)*(cosine/max(PI*sampled.w,1e-20));
+        return LightSample(sampled.xyz,p.cache_config.w,value);
+    }
+#endif
     let index = light_index * 5u; let a = lights[index]; let b = lights[index + 1u];
     let c = lights[index + 2u]; let light = lights[index + 3u];
     var toward = a.xyz; var distance = p.cache_config.w; var attenuation = 1.0;
@@ -370,7 +377,7 @@ void generate_reservoirs(uint3 gid : SV_DispatchThreadID) {
     let slot = compact_cell(lane);
     world_cache[slot].reservoir_info = uint4(MISSING, 0u, 0u, p.frame.x);
     world_cache[slot].reservoir = float4(0.0);
-    if (p.scene_info.y == 0u) { return; }
+    if (grid_light_count() == 0u) { return; }
     let position = world_cache[slot].position.xyz; let n = world_cache[slot].normal.xyz;
     let triangle = uint(world_cache[slot].position.w);
     var rng = hash32(slot ^ hash32(p.frame.x + 127u));
@@ -383,7 +390,7 @@ void generate_reservoirs(uint3 gid : SV_DispatchThreadID) {
 float3 reservoir_radiance(uint slot) {
     let info = world_cache[slot].reservoir_info; let r = world_cache[slot].reservoir;
     let triangle = uint(world_cache[slot].position.w); var incoming = float3(0.0);
-    if (info.x < p.scene_info.y && info.z != 0u) {
+    if (info.x < grid_light_count() && info.z != 0u) {
         let position = world_cache[slot].position.xyz;
         let sample_value = evaluate_light_cone(position,world_cache[slot].normal.xyz,info.x,r.xy,4.0*PI/(8.0*12000.0));
         let origin = offset_origin(position, triangle, sample_value.direction);
@@ -391,7 +398,7 @@ float3 reservoir_radiance(uint slot) {
         if (shadow.triangle == MISSING) { incoming = sample_value.value * r.z; }
     }
     let position = world_cache[slot].position.xyz;
-    incoming += sky_irradiance(world_cache[slot].normal.xyz, offset_origin(position, triangle, world_cache[slot].normal.xyz), hash32(slot ^ p.frame.x));
+    if(!grid_environment_enabled()) {incoming += sky_irradiance(world_cache[slot].normal.xyz, offset_origin(position, triangle, world_cache[slot].normal.xyz), hash32(slot ^ p.frame.x));}
     return safe_radiance(material_emission(position, triangle) + material_albedo(position, triangle) * incoming);
 }
 float mis_weight(float a, float b) {
@@ -924,6 +931,7 @@ void resolve_probes(uint3 gid : SV_DispatchThreadID,uint local : SV_GroupIndex) 
     GroupMemoryBarrierWithGroupSync();
     if(!valid) {return;}
     if(info.w==MISSING) {
+        if(source_probe_projection()) {return;}
         if(bin==0u) {probes[index].irradiance=previous_probes[info.x].irradiance;}
         if(bin<9u) {probes[index].sh[bin]=previous_probes[info.x].sh[bin];}
         probes[index].samples[bin]=previous_probes[info.x].samples[bin];return;
@@ -949,18 +957,18 @@ void resolve_probes(uint3 gid : SV_DispatchThreadID,uint local : SV_GroupIndex) 
         if(info.x!=MISSING) {estimate=lerp(previous_probes[info.x].irradiance.rgb,estimate,alpha);}
         probes[index].irradiance=float4(safe_radiance(estimate),history);
     }
-    var current=float4(0.0);var prior=float4(0.0);var current_count=0u;var prior_count=0u;
-    var total_radiance=float3(0.0);var occupied=uint2(0u);
+    var quantized=uint4(0u);var prior=float4(0.0);var current_count=0u;var prior_count=0u;
+    var total_quantized=uint3(0u);var occupied=uint2(0u);
     for(var i=0u;i<PROBE_DIRECTIONS;i++) {
-        if(probe_resolve_bin[base+i]==bin) {current+=probe_resolve_radiance[base+i];current_count++;}
+        if(probe_resolve_bin[base+i]==bin) {quantized+=probe_quantize(probe_resolve_radiance[base+i]);current_count++;}
         if(probe_resolve_prior_bin[base+i]==bin) {prior+=probe_resolve_prior[base+i];prior_count++;}
         let sampled_bin=probe_resolve_bin[base+i];
-        if(sampled_bin!=MISSING) {total_radiance+=probe_resolve_radiance[base+i].rgb;occupied[sampled_bin/32u]|=1u<<(sampled_bin%32u);}
+        if(sampled_bin!=MISSING) {total_quantized+=probe_quantize(probe_resolve_radiance[base+i]).xyz;occupied[sampled_bin/32u]|=1u<<(sampled_bin%32u);}
     }
-    prior/=float(max(prior_count,1u));current/=float(max(current_count,1u));
+    prior/=float(max(prior_count,1u));let current=probe_recover(quantized)/float(max(current_count,1u));
     let populated=countbits(occupied.x)+countbits(occupied.y);
-    var result=select(current_count!=0u,current,float4(probe_empty_cell_backup(total_radiance,populated,PROBE_DIRECTIONS),p.cache_config.w));
-    if(prior_count!=0u) {result.rgb=probe_shadow_preserving_blend(result.rgb,prior.rgb);}
+    var result=select(current_count!=0u,current,float4(probe_empty_cell_backup(float3(total_quantized)/10000.0,populated,PROBE_DIRECTIONS),p.cache_config.w));
+    if(prior_count!=0u) {result=probe_shadow_preserving_blend(result,prior);}
     probes[index].samples[bin]=probe_pack(result);
 }
 bool probe_connected(float3 position, float3 normal, uint2 pixel, uint packed_probe_pixel, float scale) {

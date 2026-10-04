@@ -139,7 +139,7 @@ fn run_source_checks(directions: u32) {
     );
     let lut = make_buffer(16384, BufferUsages::STORAGE);
     let config = WorldSpaceRestirConfig {
-        num_cells: 128,
+        num_cells: 32768,
         entries_per_cell: 2,
         ..default()
     };
@@ -290,6 +290,31 @@ fn run_source_checks(directions: u32) {
         assert_eq!(actual, prefix, "scan entry {i}");
         prefix += i as u32 % 7;
     }
+    // 512 block totals require several blocks per scan lane, exercising the
+    // second-level scan's segment offsets rather than only its small-table path.
+    params[136] = 32768;
+    params[48] = 256;
+    upload(&params);
+    let data = dispatch(&[
+        ("clear_restir", 1024),
+        ("seed_restir_scan", 1024),
+        ("scan_restir_counts", 512),
+        ("scan_restir_blocks", 1),
+        ("add_restir_block_offsets", 1024),
+        ("read_restir_scan", 4),
+    ]);
+    for (i, &actual) in data[..256].iter().enumerate() {
+        let entry = i as u32 * 256;
+        let remainder = entry % 7;
+        assert_eq!(
+            actual,
+            (entry / 7) * 21 + remainder * (remainder.saturating_sub(1)) / 2,
+            "large scan entry {entry}"
+        );
+    }
+    params[136] = 128;
+    params[48] = 0;
+    upload(&params);
     // Equal keys must share a collision slot, preserving every insertion ordinal.
     // Distinct checksums with the same bucket exhaust exactly two slots.
     let mut colliders = Vec::new();

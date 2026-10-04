@@ -26,6 +26,18 @@ float3 probe_shadow_preserving_blend(float3 current,float3 previous) {
 float3 probe_empty_cell_backup(float3 total,uint populated,uint directions) {
     return total/(float(max(populated,1u))*float(max(directions-populated,1u)));
 }
+uint4 probe_quantize(float4 value) {
+    // ScreenProbes_QuantizeRadiance uses integer sums at a scale of 10000.
+    // Bound far endpoints before conversion, where half storage uses infinity.
+    value.rgb=safe_radiance(value.rgb);value.w=clamp(value.w,0.0,min(p.cache_config.w,429496.0));
+    return uint4(round(value*10000.0));
+}
+float4 probe_recover(uint4 value) {return float4(value)/10000.0;}
+float4 probe_shadow_preserving_blend(float4 current,float4 previous) {
+    let a=luminance(current.rgb);let b=luminance(previous.rgb);
+    let response=clamp(max(a-b-min(a,b),0.0)/max(max(a,b),1e-4),0.0,0.95);
+    return lerp(current,previous,response*response);
+}
 bool source_probe_projection() {return (p.restir.w&1u)!=0u;}
 groupshared float3 probe_atlas_radiance[64];
 groupshared float3 probe_atlas_direction[64];
@@ -42,7 +54,7 @@ void project_probe_atlas(uint3 gid:SV_DispatchThreadID,uint local:SV_GroupIndex)
         probe_atlas_direction[local]=hemisphere_ray(probes[index].normal.xyz,bin_uv(bin,float2(0.5)));
     }
     GroupMemoryBarrierWithGroupSync();if(!valid||!source_probe_projection()) {return;}
-    if(bin<9u) {
+    if(bin<9u && probes[index].info.w!=MISSING) {
         var coefficient=float3(0.0);
         for(var i=0u;i<PROBE_DIRECTIONS;i++) {let basis=sh_basis(probe_atlas_direction[base+i]);coefficient+=probe_atlas_radiance[base+i]*basis[bin];}
         probes[index].sh[bin]=probe_pack_sh(float4(coefficient,float(PROBE_DIRECTIONS)));
@@ -76,25 +88,15 @@ float3x3 probe_frame(float3 n) {
     return transpose(float3x3(b1,cross(n,b1),n));
 }
 float probe_guide_weight(uint2 sample,uint bin) {
-    // Cosine-weighted radiance CDF as in SampleScreenProbes. The uniform
-    // half of the existing mixture retains coverage and a compensated PDF.
-    return max(0.001,luminance(probe_unpack(sample).rgb)*probe_hemi_octahedron(bin_uv(bin,float2(0.5))).z);
+    let weight=luminance(probe_unpack(sample).rgb)*probe_hemi_octahedron(bin_uv(bin,float2(0.5))).z;
+    return max(select(source_probe_projection(),0.0,0.001),weight);
 }
 groupshared float probe_sampling_scan[64];
 groupshared uint probe_reuse_values[256];
 groupshared uint probe_reuse_counts[64];
 void probe_reuse_add(uint index,float4 value) {
-    // Floating-point accumulation using integer CAS works without optional
-    // floating-point atomic features. Every contributing value is finite.
-    for(var channel=0u;channel<4u;channel++) {
-        var expected=0u;
-        while(true) {
-            var observed=0u;
-            InterlockedCompareExchange(probe_reuse_values[4u*index+channel],expected,
-                asuint(asfloat(expected)+value[channel]),observed);
-            if(observed==expected) {break;}expected=observed;
-        }
-    }
+    let quantized=probe_quantize(value);
+    for(var channel=0u;channel<4u;channel++) {InterlockedAdd(probe_reuse_values[4u*index+channel],quantized[channel]);}
     InterlockedAdd(probe_reuse_counts[index],1u);
 }
 void probe_reuse_reconnect(uint base,uint bin,float3 position,float3 normal,
@@ -111,6 +113,35 @@ void probe_reuse_reconnect(uint base,uint bin,float3 position,float3 normal,
     probe_reuse_add(base+direction_bin(normal,direction),value);
 }
 [shader("compute")][numthreads(64,1,1)]
+void reproject_probe_history(uint3 gid:SV_DispatchThreadID,uint local:SV_GroupIndex) {
+    let lane=gid.x+gid.y*65536u;let index=lane/PROBE_DIRECTIONS;let bin=lane%PROBE_DIRECTIONS;let base=local-bin;
+    let valid=index<probe_cache_count();
+    for(var c=0u;c<4u;c++) {probe_reuse_values[4u*local+c]=0u;}probe_reuse_counts[local]=0u;
+    GroupMemoryBarrierWithGroupSync();
+    if(valid&&probes[index].info.x!=MISSING) {
+        let old=previous_probes[probes[index].info.x];
+        probe_reuse_reconnect(base,bin,probes[index].position.xyz,probes[index].normal.xyz,old.position.xyz,old.normal.xyz,old.samples[bin]);
+        if(bin<9u) {probes[index].sh[bin]=old.sh[bin];}
+        if(bin==0u) {probes[index].irradiance=old.irradiance;}
+    }
+    GroupMemoryBarrierWithGroupSync();if(!valid) {return;}
+    var sum=float3(0.0);var populated=0u;
+    for(var i=0u;i<PROBE_DIRECTIONS;i++) {
+        sum+=float3(probe_reuse_values[4u*(base+i)],probe_reuse_values[4u*(base+i)+1u],probe_reuse_values[4u*(base+i)+2u])/10000.0;
+        populated+=uint(probe_reuse_counts[base+i]!=0u);
+    }
+    let count=probe_reuse_counts[local];
+    var value=probe_recover(uint4(probe_reuse_values[4u*local],probe_reuse_values[4u*local+1u],probe_reuse_values[4u*local+2u],probe_reuse_values[4u*local+3u]))/float(max(count,1u));
+    if(count==0u) {value=float4(probe_empty_cell_backup(sum,populated,PROBE_DIRECTIONS),p.cache_config.w);}
+    if(probes[index].position.w==0.0) {value=float4(0,0,0,-1);}
+    probes[index].samples[bin]=probe_pack(value);probes[index].filtered_samples[bin]=probe_pack(value);
+}
+[shader("compute")][numthreads(64,1,1)]
+void snapshot_reprojected_probes(uint3 gid:SV_DispatchThreadID) {
+    let index=gid.x+gid.y*65536u;if(index>=probe_cache_count()) {return;}
+    previous_probes[probe_reprojected_history()+index]=probes[index];
+}
+[shader("compute")][numthreads(64,1,1)]
 void prepare_probe_sampling(uint3 gid : SV_DispatchThreadID,uint local : SV_GroupIndex) {
     let lane=gid.x+gid.y*65536u;let bin=lane%PROBE_DIRECTIONS;
     let valid=lane<work[27].load()*PROBE_DIRECTIONS;
@@ -125,7 +156,7 @@ void prepare_probe_sampling(uint3 gid : SV_DispatchThreadID,uint local : SV_Grou
         let tile=int2(pixel/p.screen.z);
         let cell_size=max(select(p.camera.w!=0.0,probes[index].normal.w,
             length(p.camera.xyz-position)*p.reflection_thresholds.w),p.cache_config.z*4.0);
-        if(old!=MISSING) {
+        if(old!=MISSING && !source_probe_projection()) {
             probe_reuse_reconnect(base,bin,position,normal,previous_probes[old].position.xyz,
                 previous_probes[old].normal.xyz,previous_probes[old].samples[bin]);
         }
@@ -133,10 +164,16 @@ void prepare_probe_sampling(uint3 gid : SV_DispatchThreadID,uint local : SV_Grou
         // than using only the cache entry claimed for this probe's update.
         for(var y=-1;y<=1;y++) {for(var x=-1;x<=1;x++) {
             let tap=tile+int2(x,y);if(any(tap<int2(0))||any(tap>=int2(p.screen.xy))) {continue;}
+            if(source_probe_projection()) {
+                let resident=previous_probes[probe_reprojected_history()+uint(tap.x)+uint(tap.y)*p.screen.x];
+                if(resident.position.w!=0.0 && abs(dot(resident.position.xyz-position,normal))<=cell_size) {
+                    probe_reuse_reconnect(base,bin,position,normal,resident.position.xyz,resident.normal.xyz,resident.samples[bin]);
+                }
+            }
             var candidate=work[probe_cache_heads()+uint(tap.x)+uint(tap.y)*p.screen.x].load();
             for(var visited=0u;candidate!=MISSING&&visited<probe_cache_count();visited++) {
                 let cached_position=probe_cache[candidate].probe.position.xyz;
-                if(old!=p.scene_info.z+candidate && abs(dot(cached_position-position,normal))<cell_size) {
+                if((source_probe_projection() || old!=p.scene_info.z+candidate) && abs(dot(cached_position-position,normal))<cell_size) {
                     probe_reuse_reconnect(base,bin,position,normal,cached_position,
                         probe_cache[candidate].probe.normal.xyz,probe_cache[candidate].probe.samples[bin]);
                 }
@@ -148,7 +185,7 @@ void prepare_probe_sampling(uint3 gid : SV_DispatchThreadID,uint local : SV_Grou
     var weight=0.0;
     if(valid) {
         var merged=float4(0.0);
-        for(var channel=0u;channel<4u;channel++) {merged[channel]=asfloat(probe_reuse_values[4u*local+channel]);}
+        for(var channel=0u;channel<4u;channel++) {merged[channel]=float(probe_reuse_values[4u*local+channel])/10000.0;}
         let count=probe_reuse_counts[local];merged/=float(max(count,1u));
         if(count==0u) {merged.w=-1.0;}
         let packed=probe_pack(merged);probes[index].samples[bin]=packed;
@@ -191,6 +228,22 @@ float4 probe_sample_direction(uint index,uint bin,Surface s,inout uint rng) {
     let f0=lerp(float3(0.16*s.reflectance*s.reflectance),s.base,s.metallic);
     let probability=select(local_view.z>0.0,
         brdf_specular_probability(f0,dot(half_vector,view),s.base*(1.0-s.metallic)),0.0);
+    if(source_probe_projection()) {
+        let rotation=ggx_rotation_to_z(s.normal);let source_view=ggx_rotate(rotation,view);
+        let samples=float2(grid_random(rng),grid_random(rng));
+        var direction=float3(0.0);
+        if(grid_random(rng)<probability) {
+            let h=ggx_bounded_normal(max(s.roughness*s.roughness,1e-6),source_view,samples);
+            direction=normalize(ggx_rotate(float4(-rotation.xyz,rotation.w),reflect(-source_view,h)));
+        } else {
+            let sampled_bin=probe_sample_cdf(index,grid_random(rng));
+            // SampleScreenProbes retains stratification in cells with no reused
+            // samples; guided cells use the complete radiance CDF.
+            if(probe_unpack(probes[index].samples[bin]).w>0.0 && asfloat(probes[index].filtered_samples[0].y)>0.0) {bin=sampled_bin;}
+            direction=normalize(mul(frame,probe_hemi_octahedron(bin_uv(bin,float2(grid_random(rng),grid_random(rng))))));
+        }
+        return float4(direction,select(dot(direction,s.normal)>0.0,1.0,0.0));
+    }
     // The source's Fresnel layer selection is mixed with uniform coverage.
     // The full directional PDF compensates both material and radiance guiding.
     let specular_probability=0.5*probability;
@@ -251,6 +304,7 @@ float4 probe_filter_read(uint index,uint bin,bool horizontal) {
 void filter_probe_radiance(uint3 gid,bool horizontal) {
     let lane=gid.x+gid.y*65536u;if(lane>=work[0].load()*PROBE_DIRECTIONS) {return;}
     let index=compact_probe(lane/PROBE_DIRECTIONS);let bin=lane%PROBE_DIRECTIONS;
+    if(source_probe_projection() && probes[index].info.w==MISSING) {return;}
     let center_position=probes[index].position;let center_normal=probes[index].normal;
     let packed_pixel=probes[index].info.y;
     let pixel=uint2(packed_pixel%p.viewport.z,packed_pixel/p.viewport.z);

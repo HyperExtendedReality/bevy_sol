@@ -100,21 +100,30 @@ fn cubemap_orientation_importance_pdf_and_energy() {
             include_str!("environment_checks.slang"),
             &bevy_slang::SlangSettings {
                 optimization: Some(2),
-                defines: vec!["GI_HARDWARE=0".into(), "GI_TEXTURED=0".into()],
+                defines: vec![
+                    "GI_HARDWARE=0".into(),
+                    "GI_TEXTURED=0".into(),
+                    "GI_GRID_ENVIRONMENT=1".into(),
+                ],
                 ..default()
             },
         )
         .unwrap();
     bevy_slang::remap_spirv_bindings(
         &mut shader,
-        &[0, 26, 31, 32].map(|binding| bevy_slang::SpirvBindingRemap {
+        &[0, 1, 2, 20, 26, 27, 28, 31, 32].map(|binding| bevy_slang::SpirvBindingRemap {
             group: 0,
             binding,
             mapped_binding: match binding {
                 0 => 0,
-                26 => 1,
-                31 => 2,
-                _ => 3,
+                1 => 1,
+                2 => 2,
+                20 => 3,
+                26 => 4,
+                27 => 5,
+                28 => 6,
+                31 => 7,
+                _ => 8,
             },
         }),
     )
@@ -149,9 +158,43 @@ fn cubemap_orientation_importance_pdf_and_energy() {
     let uniform = buffer(576, BufferUsages::UNIFORM | BufferUsages::COPY_DST);
     let output = buffer(size, BufferUsages::STORAGE | BufferUsages::COPY_SRC);
     let staging = buffer(size, BufferUsages::MAP_READ | BufferUsages::COPY_DST);
+    let geometry = buffer(256, BufferUsages::STORAGE);
+    let lights = buffer(80, BufferUsages::STORAGE | BufferUsages::COPY_DST);
+    let work = buffer(128, BufferUsages::STORAGE);
+    let lut = buffer(16384, BufferUsages::STORAGE);
+    let grid = buffer(352, BufferUsages::STORAGE);
+    // One directional light coexists with the cubemap in the streamed RIS grid.
+    let mut light = [0.0f32; 20];
+    light[2] = 1.0;
+    light[12..15].fill(0.25);
+    queue.write_buffer(
+        &lights,
+        0,
+        &light
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect::<Vec<_>>(),
+    );
+    let storage_layout = |binding| BindGroupLayoutEntry {
+        binding,
+        visibility: ShaderStages::COMPUTE,
+        ty: BindingType::Buffer {
+            ty: BufferBindingType::Storage {
+                read_only: matches!(binding, 1 | 2),
+            },
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        },
+        count: None,
+    };
     let layout = device.create_bind_group_layout(
         "environment checks",
         &[
+            storage_layout(1),
+            storage_layout(2),
+            storage_layout(20),
+            storage_layout(27),
+            storage_layout(28),
             BindGroupLayoutEntry {
                 binding: 0,
                 visibility: ShaderStages::COMPUTE,
@@ -204,6 +247,24 @@ fn cubemap_orientation_importance_pdf_and_energy() {
         cache: None,
     });
     let sampler = device.create_sampler(&SamplerDescriptor::default());
+    let grid_pipelines: Vec<_> = [
+        "clear_light_grid_bounds",
+        "calculate_light_grid_bounds",
+        "build_light_grid",
+        "check_environment_grid",
+    ]
+    .iter()
+    .map(|name| {
+        device.create_compute_pipeline(&RawComputePipelineDescriptor {
+            label: Some(name),
+            layout: Some(&pipeline_layout),
+            module: &module,
+            entry_point: Some(name),
+            compilation_options: default(),
+            cache: None,
+        })
+    })
+    .collect();
     let directions = [
         Vec3::X,
         -Vec3::X,
@@ -292,6 +353,26 @@ fn cubemap_orientation_importance_pdf_and_energy() {
             &layout,
             &[
                 BindGroupEntry {
+                    binding: 1,
+                    resource: geometry.as_entire_binding(),
+                },
+                BindGroupEntry {
+                    binding: 2,
+                    resource: lights.as_entire_binding(),
+                },
+                BindGroupEntry {
+                    binding: 20,
+                    resource: work.as_entire_binding(),
+                },
+                BindGroupEntry {
+                    binding: 27,
+                    resource: lut.as_entire_binding(),
+                },
+                BindGroupEntry {
+                    binding: 28,
+                    resource: grid.as_entire_binding(),
+                },
+                BindGroupEntry {
                     binding: 0,
                     resource: uniform.as_entire_binding(),
                 },
@@ -314,83 +395,124 @@ fn cubemap_orientation_importance_pdf_and_energy() {
             Quat::from_rotation_z(0.17) * Quat::from_rotation_y(0.7) * Quat::from_rotation_x(0.3),
         ] {
             for mode in 0..3 {
-                let sky = if case >= 2 {
-                    Vec3::ZERO
-                } else {
-                    Vec3::splat(0.025)
-                };
-                let mut words = [0u32; 144];
-                words[34] = 1.0f32.to_bits();
-                words[40..43].copy_from_slice(&sky.to_array().map(f32::to_bits));
-                words[128..132].copy_from_slice(&rotation.conjugate().to_array().map(f32::to_bits));
-                words[132..136].copy_from_slice(&[0.8f32, mode as f32, 4.0, 3.0].map(f32::to_bits));
-                queue.write_buffer(
-                    &uniform,
-                    0,
-                    &words
-                        .into_iter()
-                        .flat_map(u32::to_le_bytes)
-                        .collect::<Vec<_>>(),
-                );
-                let mut encoder =
-                    device.create_command_encoder(&CommandEncoderDescriptor::default());
-                {
-                    let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor::default());
-                    pass.set_pipeline(&pipeline);
-                    pass.set_bind_group(0, &group, &[]);
-                    pass.dispatch_workgroups(SAMPLES as u32 / 64, 1, 1);
-                }
-                encoder.copy_buffer_to_buffer(&output, 0, &staging, 0, size);
-                queue.submit([encoder.finish()]);
-                let (send, recv) = std::sync::mpsc::channel();
-                staging
-                    .slice(..)
-                    .map_async(MapMode::Read, move |v| send.send(v).unwrap());
-                device
-                    .poll(PollType::Wait {
-                        submission_index: None,
-                        timeout: Some(Duration::from_secs(30)),
-                    })
-                    .unwrap();
-                recv.recv().unwrap().unwrap();
-                let data = staging.slice(..).get_mapped_range();
-                let values: Vec<_> = data
-                    .as_chunks::<16>()
-                    .0
-                    .iter()
-                    .map(|bytes| {
-                        Vec4::from_array(std::array::from_fn(|i| {
-                            f32::from_le_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap())
-                        }))
-                    })
-                    .collect();
-                for (i, direction) in directions.iter().enumerate() {
-                    let expected =
-                        sky + 0.8 * lookup(&pixels, rotation.conjugate() * direction.normalize());
-                    assert!(
-                        values[i].truncate().abs_diff_eq(expected, 1e-5),
-                        "orientation {case}/{mode}/{i}: {} vs {expected}",
-                        values[i]
+                for merge in [None, Some(0u32), Some(1), Some(2)] {
+                    let sky = if case >= 2 {
+                        Vec3::ZERO
+                    } else {
+                        Vec3::splat(0.025)
+                    };
+                    let mut words = [0u32; 144];
+                    words[34] = 1.0f32.to_bits();
+                    words[40..43].copy_from_slice(&sky.to_array().map(f32::to_bits));
+                    words[128..132]
+                        .copy_from_slice(&rotation.conjugate().to_array().map(f32::to_bits));
+                    words[132..136]
+                        .copy_from_slice(&[0.8f32, mode as f32, 4.0, 3.0].map(f32::to_bits));
+                    words[62] = 0.002f32.to_bits();
+                    words[63] = 1000.0f32.to_bits();
+                    words[57] = u32::from(merge.is_some());
+                    words[92..96].copy_from_slice(&[1, 8, 2, merge.unwrap_or(0)]);
+                    words[139] = u32::from(merge.is_some());
+                    queue.write_buffer(
+                        &uniform,
+                        0,
+                        &words
+                            .into_iter()
+                            .flat_map(u32::to_le_bytes)
+                            .collect::<Vec<_>>(),
                     );
-                }
-                let mut sum = bevy::math::DVec3::ZERO;
-                for value in &values[14..] {
-                    assert!(value.is_finite(), "nonfinite sample {value}");
-                    assert!(
-                        value.w < 0.004,
-                        "sample/PDF disagreement {case}/{mode}: {value}"
+                    let mut encoder =
+                        device.create_command_encoder(&CommandEncoderDescriptor::default());
+                    {
+                        let mut pass =
+                            encoder.begin_compute_pass(&ComputePassDescriptor::default());
+                        pass.set_pipeline(&pipeline);
+                        pass.set_bind_group(0, &group, &[]);
+                        pass.dispatch_workgroups(SAMPLES as u32 / 64, 1, 1);
+                    }
+                    if merge.is_some() {
+                        for (i, pipeline) in grid_pipelines.iter().enumerate() {
+                            let mut pass = encoder.begin_compute_pass(&default());
+                            pass.set_pipeline(pipeline);
+                            pass.set_bind_group(0, &group, &[]);
+                            pass.dispatch_workgroups(
+                                if i == 3 { SAMPLES as u32 / 64 } else { 1 },
+                                1,
+                                1,
+                            );
+                        }
+                    }
+                    encoder.copy_buffer_to_buffer(&output, 0, &staging, 0, size);
+                    queue.submit([encoder.finish()]);
+                    let (send, recv) = std::sync::mpsc::channel();
+                    staging
+                        .slice(..)
+                        .map_async(MapMode::Read, move |v| send.send(v).unwrap());
+                    device
+                        .poll(PollType::Wait {
+                            submission_index: None,
+                            timeout: Some(Duration::from_secs(30)),
+                        })
+                        .unwrap();
+                    recv.recv().unwrap().unwrap();
+                    let data = staging.slice(..).get_mapped_range();
+                    let values: Vec<_> = data
+                        .as_chunks::<16>()
+                        .0
+                        .iter()
+                        .map(|bytes| {
+                            Vec4::from_array(std::array::from_fn(|i| {
+                                f32::from_le_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap())
+                            }))
+                        })
+                        .collect();
+                    for (i, direction) in directions.iter().enumerate() {
+                        let expected = sky
+                            + 0.8 * lookup(&pixels, rotation.conjugate() * direction.normalize());
+                        assert!(
+                            values[i].truncate().abs_diff_eq(expected, 1e-5),
+                            "orientation {case}/{mode}/{i}: {} vs {expected}",
+                            values[i]
+                        );
+                    }
+                    let mut sum = bevy::math::DVec3::ZERO;
+                    for value in &values[14..] {
+                        assert!(value.is_finite(), "nonfinite sample {value}");
+                        if let Some(merge) = merge {
+                            assert_eq!(
+                                value.w,
+                                if merge == 1 {
+                                    if case == 2 { 1.0 } else { 2.0 }
+                                } else {
+                                    8.0
+                                },
+                                "source RIS sample count"
+                            );
+                        } else {
+                            assert!(
+                                value.w < 0.004,
+                                "sample/PDF disagreement {case}/{mode}: {value}"
+                            );
+                        }
+                        sum += value.truncate().as_dvec3();
+                    }
+                    let mean = (sum / SAMPLES as f64).as_vec3();
+                    let expected = reference(&pixels, rotation, sky, 0.8)
+                        + if merge.is_some() {
+                            Vec3::splat(0.25 / std::f32::consts::PI)
+                        } else {
+                            Vec3::ZERO
+                        };
+                    println!(
+                        "environment case={case} mode={mode} merge={merge:?} mean={mean} reference={expected}"
                     );
-                    sum += value.truncate().as_dvec3();
+                    assert!(
+                        mean.abs_diff_eq(expected, 0.015 * expected.max_element().max(0.1)),
+                        "environment energy {mean} vs {expected}"
+                    );
+                    drop(data);
+                    staging.unmap();
                 }
-                let mean = (sum / SAMPLES as f64).as_vec3();
-                let expected = reference(&pixels, rotation, sky, 0.8);
-                println!("environment case={case} mode={mode} mean={mean} reference={expected}");
-                assert!(
-                    mean.abs_diff_eq(expected, 0.015 * expected.max_element().max(0.1)),
-                    "environment energy {mean} vs {expected}"
-                );
-                drop(data);
-                staging.unmap();
             }
         }
     }

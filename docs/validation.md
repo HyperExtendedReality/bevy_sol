@@ -5,6 +5,27 @@ GPU, Vulkan, wgpu 29.0.4, Slang 2026.19 and the custom `bevy_slang` crate.
 AMD reference commit: `914b91596cd119eda85fbc1d3c7ee6ac391b1452`.
 This records measured behavior, not completed upstream parity.
 
+## 2026-10-04 continuation
+
+The following checks were rerun while implementing source atlas spawn/patch and
+reprojection, fixed-point probe reuse, integrated environment RIS and multibounce
+BRDF/PDF transport. They supplement, rather than replace, the earlier matrix below.
+
+| Check | Result |
+|---|---|
+| Native source probe scheduler | 108 combinations of full/quarter/sixteenth mode, Halton frames, one-pixel/odd/partial extents, reset/history/disocclusion/sky; fixed spawn budget, seed ownership and compaction passed |
+| Native source sampling/accumulation | Fixed-point quantization, four-channel shadow-preserving blend, full GGX selection, pure radiance-CDF selection with no uniform mixture, incident-radiance weights, claimed-nearest cache inclusion and half-packed matte multibounce BRDF/PDF with survival compensation passed |
+| Native environment fixture | 96 configurations covering all three sampling distributions, two rotations, four maps and separate/grid sampling with each merge policy; independent hemisphere energy, PDF agreement and RIS counts passed |
+| ReSTIR/hash/light grid fixtures | GPU collision/packing/mip/estimator checks passed; the ReSTIR count scan also covers 32,768 cells and 512 block totals |
+| Hardware source transport, 64 directions, ReSTIR enabled | Emitter/point/spot/directional means 0.5317/0.3975/0.3116/0.1765, mirror 1.0; dark phases and geometry/material/texture/deformation invalidation passed |
+| Software source transport, 16 directions, ReSTIR enabled | Emitter/point/spot/directional means 0.4090/0.2660/0.2364/0.1215, mirror 1.0; regression phases passed |
+| Hardware moving receiver, rigid/skin/morph | Pose-only cache reset preserves compatible reprojected screen-probe and pixel histories; uniform-environment stability passed in all three modes; software rigid/skin also passed |
+| Software compensated furnace, raw cubemap plus sky, 64 directions, split reflections | Lambertian mean 0.418382 versus 0.416667; GGX means 0.416016/0.404119/0.261623 versus 0.416423/0.409126/0.261222; all tolerances passed |
+| Slang specialization fixture | All eight tracing/texture/direction variants, entry points, uniform offsets and storage strides passed |
+| Rust/build checks | `cargo test --all-targets` passed (13 non-GPU unit tests); `cargo clippy --all-targets -- -D warnings`, formatting and whitespace checks passed |
+
+These tests do not establish image or performance equivalence to Capsaicin.
+
 ## Commands and results
 
 | Command / configuration | Result |

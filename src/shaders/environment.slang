@@ -1,6 +1,18 @@
 // AMD Capsaicin lights/box_sampling.hlsl and light_sampling.hlsl, pinned in
 // THIRD_PARTY_NOTICES.md. Hardened black-map handling and matching PDF descent.
 bool has_environment() { return any(p.sky.rgb > 0.0) || p.environment.x > 0.0; }
+#ifndef GI_GRID_ENVIRONMENT
+#define GI_GRID_ENVIRONMENT 0
+#endif
+bool grid_environment_enabled() {
+#if GI_GRID_ENVIRONMENT
+    return source_probe_projection()&&has_environment();
+#else
+    return false;
+#endif
+}
+uint grid_light_count() {return p.scene_info.y+uint(grid_environment_enabled());}
+bool grid_environment_light(uint light) {return grid_environment_enabled()&&light==p.scene_info.y;}
 float3 environment_rotate(float4 q,float3 v) {
     return v+2.0*cross(q.xyz,cross(q.xyz,v)+q.w*v);
 }
@@ -10,6 +22,29 @@ float3 environment_local_radiance(float3 direction,float level) {
 }
 float3 environment_radiance(float3 direction) {
     return environment_local_radiance(environment_rotate(p.environment_rotation,direction),0.0);
+}
+float3 environment_radiance_cone(float3 direction,float solid_angle) {
+    let level=select(solid_angle>0.0,log2(max(solid_angle/(4.0*PI),1e-30))+p.environment.w-1.0,0.0);
+    return environment_local_radiance(environment_rotate(p.environment_rotation,direction),max(level,0.0));
+}
+float grid_environment_weight(float3 normal,bool oriented) {
+#if GI_GRID_ENVIRONMENT
+    var radiance=float3(0.0);var count=0u;
+    for(var axis=0u;axis<3u;axis++) {
+        if(oriented) {
+            if(normal[axis]==0.0) {continue;}
+            var direction=float3(0.0);direction[axis]=sign(normal[axis]);
+            radiance+=environment_local_radiance(direction,max(p.environment.w-1.0,0.0));count++;
+        } else {
+            var direction=float3(0.0);direction[axis]=1.0;
+            radiance+=environment_local_radiance(direction,max(p.environment.w-1.0,0.0));
+            radiance+=environment_local_radiance(-direction,max(p.environment.w-1.0,0.0));count+=2u;
+        }
+    }
+    return luminance(radiance)*(4.0*PI/float(max(count,1u)));
+#else
+    return 0.0;
+#endif
 }
 static const float3 ENVIRONMENT_FACES[6]={
     float3(1,0,0),float3(-1,0,0),float3(0,1,0),float3(0,-1,0),float3(0,0,1),float3(0,0,-1)

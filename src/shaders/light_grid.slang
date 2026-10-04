@@ -11,11 +11,12 @@ void request_light_location(float3 position) {
     for(var i=0u;i<3u;i++) {light_grid[i].min(ordered_float(position[i]));light_grid[3u+i].max(ordered_float(position[i]));}
     light_grid[6].add(1u);
 }
-float grid_random(inout uint state) {
+uint grid_random_uint(inout uint state) {
     let old=state;state=old*747796405u+2891336453u;
     var word=((old>>((old>>28u)+4u))^old)*277803737u;word=(word>>22u)^word;
-    return float(word>>8u)/16777216.0;
+    return word;
 }
+float grid_random(inout uint state) {return float(grid_random_uint(state)>>8u)/16777216.0;}
 [shader("compute")][numthreads(1,1,1)]
 void clear_light_grid_bounds() {
     for(var i=0u;i<3u;i++) {light_grid[i].store(ordered_float(1e30));light_grid[3u+i].store(ordered_float(-1e30));}
@@ -25,7 +26,7 @@ uint4 grid_dimensions() {return uint4(light_grid[8].load(),light_grid[9].load(),
 float3 grid_minimum() {return float3(asfloat(light_grid[12].load()),asfloat(light_grid[13].load()),asfloat(light_grid[14].load()));}
 float3 grid_cell_size() {return float3(asfloat(light_grid[16].load()),asfloat(light_grid[17].load()),asfloat(light_grid[18].load()));}
 uint grid_faces() {return select((p.light_grid.z&2u)!=0u,8u,1u);}
-bool grid_parallel() {return (p.light_grid.z&8u)!=0u && p.scene_info.y>128u*p.light_grid.y;}
+bool grid_parallel() {return (p.light_grid.z&8u)!=0u && grid_light_count()>128u*p.light_grid.y;}
 [shader("compute")][numthreads(1,1,1)]
 void calculate_light_grid_bounds() {
     var lower=float3(0.0);var upper=float3(1.0);
@@ -39,13 +40,14 @@ void calculate_light_grid_bounds() {
         light_grid[8u+i].store(cells[i]);light_grid[12u+i].store(asuint(lower[i]));
         light_grid[16u+i].store(asuint(size[i]));light_grid[20u+i].store(asuint(extent[i]));
     }
-    let slots=min(p.light_grid.y,p.scene_info.y);light_grid[11].store(slots);
+    let slots=min(p.light_grid.y,grid_light_count());light_grid[11].store(slots);
     let count=cells.x*cells.y*cells.z*slots*grid_faces();
     if (grid_parallel()) {work[24].store(min(count,65535u));work[25].store((count+65534u)/65535u);}
     else {work[24].store((min(count,65536u)+63u)/64u);work[25].store((count+65535u)/65536u);}
     work[26].store(1u);
 }
 float grid_point_weight(uint light_index, float3 position) {
+    if(grid_environment_light(light_index)) {return grid_environment_weight(float3(0.0),false);}
     let index=light_index*5u;let a=lights[index];let b=lights[index+1u];let c=lights[index+2u];let emission=lights[index+3u];
     if (emission.w==0.0) {return luminance(emission.rgb);}
     var radiance=emission.rgb;
@@ -61,6 +63,7 @@ float grid_point_weight(uint light_index, float3 position) {
     return luminance(radiance)*clamp(1.0-distance_squared*distance_squared/range4,0.0,1.0)/(0.0001+distance_squared);
 }
 float grid_point_normal_weight(uint light_index,float3 position,float3 normal) {
+    if(grid_environment_light(light_index)) {return grid_environment_weight(environment_rotate(p.environment_rotation,normal),true);}
     let index=light_index*5u;let a=lights[index];let b=lights[index+1u];let c=lights[index+2u];let kind=lights[index+3u].w;
     var cosine=0.0;
     if (kind==0.0) {cosine=clamp(dot(a.xyz,normal),0.0,1.0);}
@@ -73,6 +76,9 @@ float grid_point_normal_weight(uint light_index,float3 position,float3 normal) {
     return grid_point_weight(light_index,position)*cosine;
 }
 float grid_volume_weight(uint light_index, float3 minimum, float3 extent,float3 normal) {
+    if(grid_environment_light(light_index)) {
+        return grid_environment_weight(environment_rotate(p.environment_rotation,normal),grid_faces()==8u);
+    }
     let index=light_index*5u;let a=lights[index];let b=lights[index+1u];let emission=lights[index+3u];
     let directional=grid_faces()==8u;
     if (emission.w==0.0) {return select(directional && dot(a.xyz,normal)<=-0.7071,0.0,luminance(emission.rgb));}
@@ -143,7 +149,7 @@ void build_light_grid(uint3 gid : SV_DispatchThreadID) {
     let reservoir=lane%dims.w;
     let increment=(p.frame.x<<1u)|1u;var rng=(pcg_hash(lane)+increment)*747796405u+increment;
     var selected=MISSING;var selected_weight=0.0;var total=0.0;var j=grid_random(rng);var none_probability=1.0;
-    for(var light=reservoir;light<p.scene_info.y;light+=dims.w) {
+    for(var light=reservoir;light<grid_light_count();light+=dims.w) {
         let weight=grid_reservoir_weight(lane,light);if (!(weight>0.0)) {continue;}
         total+=weight;let probability=weight/total;j-=probability*none_probability;none_probability*=1.0-probability;
         if (j<=0.0) {selected=light;selected_weight=weight;j=grid_random(rng);none_probability=1.0;}
@@ -160,7 +166,7 @@ void build_light_grid_parallel(uint3 group : SV_GroupID,uint thread : SV_GroupIn
     if (lane>=count || dims.w==0u) {return;}
     var rng=pcg_hash(lane*128u+thread+p.frame.x);
     var selected=MISSING;var selected_weight=0.0;var total=0.0;var j=grid_random(rng);var none_probability=1.0;
-    for(var light=lane%dims.w+thread*dims.w;light<p.scene_info.y;light+=128u*dims.w) {
+    for(var light=lane%dims.w+thread*dims.w;light<grid_light_count();light+=128u*dims.w) {
         let weight=grid_reservoir_weight(lane,light);if (!(weight>0.0)) {continue;}
         total+=weight;let probability=weight/total;j-=probability*none_probability;none_probability*=1.0-probability;
         if (j<=0.0) {selected=light;selected_weight=weight;j=grid_random(rng);none_probability=1.0;}
@@ -196,7 +202,7 @@ GridLight grid_merge(uint start, uint count, float3 position, float3 normal, ino
     }
     var selected=MISSING;var selected_weight=0.0;var total=0.0;var j=grid_random(rng);var none_probability=1.0;
     for(var i=0u;i<count;i++) {
-        let address=24u+(start+i)*4u;let light=light_grid[address].load();if (light>=p.scene_info.y) {continue;}
+        let address=24u+(start+i)*4u;let light=light_grid[address].load();if (light>=grid_light_count()) {continue;}
         var target=asfloat(light_grid[address+1u].load());var weight=asfloat(light_grid[address+2u].load());
         if ((p.light_grid.w&4u)!=0u) {
             // Local point/normal importance resampling retains the original
@@ -235,7 +241,7 @@ Reservoir grid_fresh_reservoir(float3 position, float3 normal, float3 view, uint
         for(var i=0u;i<min(count,8u);i++) {
             let offset=i*segment;if (offset>=count) {break;} // prevent upstream unsigned segment underflow
             let sample=grid_merge(start+offset,min(segment,count-offset),position,normal,rng);
-            if (sample.index<p.scene_info.y && sample.pdf>0.0) {samples[added]=sample;added++;}
+            if (sample.index<grid_light_count() && sample.pdf>0.0) {samples[added]=sample;added++;}
         }
         for(var i=0u;i<added;i++) {
             let sample=samples[i];let uv=float2(random(rng),random(rng));let target=grid_target(position,normal,view,triangle,sample.index,uv);
@@ -246,7 +252,7 @@ Reservoir grid_fresh_reservoir(float3 position, float3 normal, float3 view, uint
             let sample=grid_merge(start,count,position,normal,rng);
             // Empty uniformly selected slots are zero-contribution draws. Dropping
             // them from M would condition on success and brighten sparse cells.
-            if (sample.index>=p.scene_info.y || sample.pdf<=0.0) {result.count++;continue;}
+            if (sample.index>=grid_light_count() || sample.pdf<=0.0) {result.count++;continue;}
             let uv=float2(random(rng),random(rng));let target=grid_target(position,normal,view,triangle,sample.index,uv);
             reservoir_add(result,sample.index,uv,target,target/sample.pdf,1u,rng);
         }

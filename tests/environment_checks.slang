@@ -17,3 +17,14 @@ void check_environment(uint3 gid:SV_DispatchThreadID) {
     let evaluated=environment_pdf(p.camera.xyz,sample.xyz);
     environment_checks[14u+gid.x]=float4(value,abs(sample.w-evaluated)/max(sample.w,1e-20));
 }
+[shader("compute")][numthreads(64,1,1)]
+void check_environment_grid(uint3 gid:SV_DispatchThreadID) {
+    var rng=pcg_hash(gid.x+937u);
+    let result=grid_fresh_reservoir(float3(0),p.camera.xyz,p.camera.xyz,MISSING,rng);
+    var value=float3(0);
+    if(result.light<grid_light_count()&&result.target_density>0.0&&result.count>0u) {
+        let selected=evaluate_light_cone(float3(0),p.camera.xyz,result.light,result.uv,0.0);
+        value=selected.value*(result.weight_sum/(float(result.count)*result.target_density));
+    }
+    environment_checks[14u+gid.x]=float4(value,float(result.count));
+}

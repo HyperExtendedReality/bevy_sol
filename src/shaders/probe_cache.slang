@@ -25,6 +25,13 @@ uint probe_cache_reordered() {return probe_cache_mru()+probe_cache_count();}
 uint probe_cache_blocks() {return probe_cache_reordered()+probe_cache_count();}
 uint probe_fresh_list() {return probe_cache_blocks()+(probe_cache_count()+127u)/128u;}
 uint compact_fresh_probe(uint lane) {return work[probe_fresh_list()+lane].load();}
+uint probe_patch_work() {return probe_fresh_list()+p.scene_info.z;}
+uint probe_empty_tiles() {return probe_patch_work()+4u;}
+uint probe_override_tiles() {return probe_empty_tiles()+probe_cache_count();}
+uint probe_spawn_seeds() {return probe_override_tiles()+probe_cache_count();}
+uint probe_reprojected_history() {return p.scene_info.z+probe_cache_count();}
+uint probe_spawn_size() {return p.screen.z*(1u<<(uint(p.quality.w)>>1u));}
+uint2 probe_spawn_dimensions() {let size=probe_spawn_size();return (p.viewport.zw+size-1u)/size;}
 float probe_halton_number(uint index,uint base) {
     var factor=1.0;var result=0.0;
     while(index>0u) {factor/=float(base);result+=factor*float(index%base);index/=base;}
@@ -44,6 +51,86 @@ bool probe_should_refresh(uint2 tile) {
     // Clamp the selected tile at partial borders so each region has a seed.
     let phase=min(probe_spawn_jitter(axis*p.screen.z)/p.screen.z,extent-1u);
     return all(tile==group*axis+phase);
+}
+// ReprojectScreenProbes chooses the best compatible seed over the entire tile.
+// Spawn/compact/patch then redistribute queries without increasing the budget.
+[shader("compute")][numthreads(64,1,1)]
+void reproject_screen_probes(uint3 gid:SV_DispatchThreadID) {
+    let index=gid.x+gid.y*65536u;if(index>=p.scene_info.z) {return;}
+    probes[index].position=float4(0.0);probes[index].irradiance=float4(0.0);
+    probes[index].filtered_irradiance=float4(0.0);probes[index].info=uint4(MISSING,0u,MISSING,MISSING);
+    if(index==0u) {for(var i=0u;i<4u;i++) {work[probe_patch_work()+i].store(0u);}}
+    if(index>=probe_cache_count()) {return;}
+    work[probe_mask_offset(0u)+index].store(MISSING);
+    let tile=uint2(index%p.screen.x,index/p.screen.x);let start=tile*p.screen.z;
+    var best=MISSING;var best_pixel=uint2(0u);var score=1e30;
+    for(var y=0u;y<p.screen.z;y++) {for(var x=0u;x<p.screen.z;x++) {
+        let pixel=start+uint2(x,y);if(any(pixel>=p.viewport.zw)) {continue;}
+        let s=surface(pixel);if(!s.valid||(p.frame.y&1u)!=0u) {continue;}
+        let uv=reproject_surface(pixel,s.position);
+        if(any(uv<float2(0.0))||any(uv>=float2(1.0))) {continue;}
+        let old_tile=uint2(uv*float2(p.viewport.zw))/p.screen.z;
+        let old_index=old_tile.x+old_tile.y*p.screen.x;let old=previous_probes[old_index];
+        let cell_size=max(select(p.camera.w!=0.0,footprint(s,pixel),distance(p.camera.xyz,s.position)*p.reflection_thresholds.w),p.cache_config.z*4.0);
+        if(old.position.w==0.0||dot(old.normal.xyz,s.normal)<=0.95||abs(dot(old.position.xyz-s.position,s.normal))>=cell_size) {continue;}
+        let candidate=unpack2x16float(pack2x16float(float2(distance(old.position.xyz,s.position)/cell_size,0.0))).x;
+        if(candidate<score) {best=old_index;best_pixel=pixel;score=candidate;}
+    }}
+    if(best!=MISSING) {
+        let s=surface(best_pixel);probes[index].position=float4(s.position,1.0);
+        probes[index].normal=float4(s.normal,footprint(s,best_pixel));
+        probes[index].info.x=best;probes[index].info.y=best_pixel.x+best_pixel.y*p.viewport.z;
+        work[probe_mask_offset(0u)+index].store(index);
+    }
+}
+[shader("compute")][numthreads(64,1,1)]
+void schedule_screen_probes(uint3 gid:SV_DispatchThreadID) {
+    let index=gid.x+gid.y*65536u;if(index>=probe_cache_count()) {return;}
+    let tile=uint2(index%p.screen.x,index/p.screen.x);let dims=probe_spawn_dimensions();
+    let axis=probe_spawn_size()/p.screen.z;let region=tile/axis;
+    let seed=min(region*probe_spawn_size()+probe_spawn_jitter(probe_spawn_size()),p.viewport.zw-1u);
+    let selected=all(seed/p.screen.z==tile);
+    if(selected) {
+        let query=region.x+region.y*dims.x;
+        work[probe_spawn_seeds()+query].store(MISSING);
+        if(surface(seed).valid) {
+            work[probe_spawn_seeds()+query].store(seed.x+seed.y*p.viewport.z);
+            work[probe_patch_work()+2u].add(1u);
+            if(probes[index].position.w!=0.0) {
+                let rank=work[probe_patch_work()+1u].add(1u);work[probe_override_tiles()+rank].store(query);
+            }
+        }
+    } else if(probes[index].position.w==0.0) {
+        let seed2=min(tile*p.screen.z+probe_spawn_jitter(p.screen.z),p.viewport.zw-1u);
+        if(surface(seed2).valid) {let rank=work[probe_patch_work()].add(1u);work[probe_empty_tiles()+rank].store(index);}
+    }
+}
+[shader("compute")][numthreads(64,1,1)]
+void patch_screen_probes(uint3 gid:SV_DispatchThreadID) {
+    let lane=gid.x+gid.y*65536u;let count=work[probe_patch_work()+1u].load();
+    if(lane>=work[probe_patch_work()].load()||count==0u) {return;}
+    let index=work[probe_empty_tiles()+lane].load();let tile=uint2(index%p.screen.x,index/p.screen.x);
+    let seed=min(tile*p.screen.z+probe_spawn_jitter(p.screen.z),p.viewport.zw-1u);
+    var rng=pcg_hash(lane+p.frame.x);let rank=grid_random_uint(rng)%count;
+    let query=work[probe_override_tiles()+rank].load();
+    // The source exchange permits collisions: the last patch owns the query.
+    work[probe_spawn_seeds()+query].exchange(seed.x+seed.y*p.viewport.z);
+}
+[shader("compute")][numthreads(64,1,1)]
+void commit_screen_probes(uint3 gid:SV_DispatchThreadID) {
+    let query=gid.x+gid.y*65536u;let dims=probe_spawn_dimensions();if(query>=dims.x*dims.y) {return;}
+    let packed=work[probe_spawn_seeds()+query].load();if(packed==MISSING) {return;}
+    let seed=uint2(packed%p.viewport.z,packed/p.viewport.z);let tile=seed/p.screen.z;
+    let index=tile.x+tile.y*p.screen.x;let s=surface(seed);
+    probes[index].position=float4(s.position,1.0);probes[index].normal=float4(s.normal,footprint(s,seed));
+    probes[index].info.y=packed;probes[index].info.w=1u;
+    work[probe_mask_offset(0u)+index].store(index);
+}
+[shader("compute")][numthreads(64,1,1)]
+void compact_screen_probes(uint3 gid:SV_DispatchThreadID) {
+    let index=gid.x+gid.y*65536u;if(index>=probe_cache_count()||probes[index].position.w==0.0) {return;}
+    let rank=work[0].add(1u);work[WORK_HEADER+rank].store(index);
+    if(probes[index].info.w!=MISSING) {let fresh=work[27].add(1u);work[probe_fresh_list()+fresh].store(index);}
 }
 float4 probe_cache_projection_column(uint column) {
     var value=float4(0.0);let first=probe_cache_work()+4u+column*4u;
@@ -86,6 +173,7 @@ void probe_cache_touch(uint slot) {
 void reuse_cached_probes(uint3 gid : SV_DispatchThreadID) {
     let index=gid.x+gid.y*65536u;if(index>=p.scene_info.z) {return;}
     probes[index].info.z=MISSING;if(probes[index].position.w==0.0) {return;}
+    if(source_probe_projection() && probes[index].info.w==MISSING) {return;}
     let position=probes[index].position.xyz;let normal=probes[index].normal.xyz;
     let pixel=uint2(probes[index].info.y%p.viewport.z,probes[index].info.y/p.viewport.z);
     let tile=int2(pixel/p.screen.z);var best=MISSING;var score=1e30;
@@ -120,6 +208,7 @@ void allocate_probe_cache(uint3 gid : SV_DispatchThreadID) {
     // consume its prefix, with one owner per slot and no serial CAS search.
     let lane=gid.x+gid.y*65536u;if(lane>=work[0].load()) {return;}
     let index=compact_probe(lane);if(probes[index].info.z!=MISSING) {return;}
+    if(source_probe_projection() && probes[index].info.w==MISSING) {return;}
     let rank=work[probe_cache_work()+2u].add(1u);
     if(rank>=work[probe_cache_work()+1u].load()) {return;}
     let slot=work[probe_cache_reordered()+rank].load();
