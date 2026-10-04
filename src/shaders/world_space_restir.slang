@@ -100,17 +100,23 @@ float3 restir_jitter(float3 position,float3 normal,inout uint rng) {
     return position+mul(probe_frame(normal),float3(jitter,0.0));
 }
 void restir_generate(uint index,bool bounce) {
-    let sample=index+select(bounce,restir_ray_capacity(),0u);
-    restir_store_reservoir(sample,PackedReservoir(MISSING,float2(0.0),0.0,0.0,1.0));
+    var sample=index+select(bounce,restir_ray_capacity(),0u);
     let ray=rays[index];let info=select(bounce,ray.bounce_info,ray.info);
+    let source=source_probe_projection();
+    if(source && select(bounce,info.x,info.w)==MISSING) {return;}
+    let query=select(source,source_visibility_id(index,bounce),sample);
+    if(source) {work[source_shadow_ids()+query].store(MISSING);}
+    else {restir_store_reservoir(sample,PackedReservoir(MISSING,float2(0.0),0.0,0.0,1.0));}
     if(!bounce && ray.info.x==EMISSIVE_PROBE_RAY) {return;}
     let position=select(bounce,ray.bounce_position.xyz,ray.position.xyz);
     let normal=select(bounce,ray.bounce_normal.xyz,ray.normal.xyz);
     if(info.y==MISSING||all(normal==float3(0.0))||grid_light_count()==0u|| (bounce&&info.x==MISSING)) {return;}
     let origin=select(bounce,ray.position.xyz,probes[index/PROBE_DIRECTIONS].position.xyz);
     let view=normalize(origin-position);var rng=pcg_hash(sample+p.frame.x);
+    if(source) {rng=source_random(query,p.frame.x);}
     let fresh=grid_fresh_reservoir(position,normal,view,info.y,rng);
     if(fresh.light==MISSING||fresh.count==0u||fresh.target_density<=0.0) {return;}
+    if(source) {sample=source_append_shadow(query);}
     let address=restir_samples()+4u*sample;
     restir[address].store(pack2x16float(origin.xy));restir[address+1u].store(pack2x16float(float2(origin.z,0.0)));
     restir[address+2u].store(pack2x16float(position.xy));restir[address+3u].store(pack2x16float(float2(position.z,0.0)));
@@ -124,12 +130,22 @@ void restir_generate(uint index,bool bounce) {
 [shader("compute")][numthreads(64,1,1)]
 void generate_restir(uint3 gid:SV_DispatchThreadID) {
     let lane=gid.x+gid.y*65536u;if(lane>=work[27].load()*PROBE_DIRECTIONS) {return;}
-    restir_generate(compact_fresh_probe(lane/PROBE_DIRECTIONS)*PROBE_DIRECTIONS+lane%PROBE_DIRECTIONS,false);
+    var index=compact_fresh_probe(lane/PROBE_DIRECTIONS)*PROBE_DIRECTIONS+lane%PROBE_DIRECTIONS;
+    if(source_probe_projection()) {
+        if(lane>=work[7].load()) {return;}
+        index=work[source_visibility_list(false)+lane].load();
+    }
+    restir_generate(index,false);
 }
 [shader("compute")][numthreads(64,1,1)]
 void generate_restir_bounces(uint3 gid:SV_DispatchThreadID) {
     let lane=gid.x+gid.y*65536u;if(lane>=work[27].load()*PROBE_DIRECTIONS) {return;}
-    restir_generate(compact_fresh_probe(lane/PROBE_DIRECTIONS)*PROBE_DIRECTIONS+lane%PROBE_DIRECTIONS,true);
+    var index=compact_fresh_probe(lane/PROBE_DIRECTIONS)*PROBE_DIRECTIONS+lane%PROBE_DIRECTIONS;
+    if(source_probe_projection()) {
+        if(lane>=work[11].load()) {return;}
+        index=work[source_visibility_list(true)+lane].load();
+    }
+    restir_generate(index,true);
 }
 groupshared uint restir_prefix[128];
 [shader("compute")][numthreads(128,1,1)]
@@ -194,7 +210,9 @@ void restir_resample(uint sample) {
     let ox=unpack2x16float(restir[address].load());let oz=unpack2x16float(restir[address+1u].load());
     let wx=unpack2x16float(restir[address+2u].load());let wz=unpack2x16float(restir[address+3u].load());
     let origin=float3(ox,oz.x);let world=float3(wx,wz.x);let normal=restir_unpack_normal(restir[restir_normals(false)+sample].load());
-    var rng=pcg_hash(sample+p.frame.x);let entry=restir_find_previous(restir_jitter(world,normal,rng));
+    var rng=pcg_hash(sample+p.frame.x);
+    if(source_probe_projection()) {rng=source_random(sample,p.frame.x);}
+    let entry=restir_find_previous(restir_jitter(world,normal,rng));
     if(entry==MISSING) {return;}
     let previous=restir_table(true);let count=restir[previous+restir_entries()+entry].load();if(count==0u) {return;}
     let index=restir[previous+2u*restir_entries()+entry].load();let increment=(count+3u)/4u;
@@ -216,5 +234,14 @@ void restir_resample(uint sample) {
 void resample_restir(uint3 gid:SV_DispatchThreadID) {
     let lane=gid.x+gid.y*65536u;if(lane>=work[27].load()*PROBE_DIRECTIONS) {return;}
     let index=compact_fresh_probe(lane/PROBE_DIRECTIONS)*PROBE_DIRECTIONS+lane%PROBE_DIRECTIONS;
-    restir_resample(index);if(p.options.y!=0u) {restir_resample(index+restir_ray_capacity());}
+    if(source_probe_projection()) {
+        if(rays[index].info.w!=MISSING) {
+            let sample=source_lighting_id(index,false);if(sample!=MISSING) {restir_resample(sample);}
+        }
+        if(p.options.y!=0u && rays[index].bounce_info.x!=MISSING) {
+            let sample=source_lighting_id(index,true);if(sample!=MISSING) {restir_resample(sample);}
+        }
+    } else {
+        restir_resample(index);if(p.options.y!=0u) {restir_resample(index+restir_ray_capacity());}
+    }
 }

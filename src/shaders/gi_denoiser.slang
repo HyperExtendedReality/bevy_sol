@@ -8,6 +8,11 @@ float4 gi_denoiser_sanitize(float4 color) {
     return select(finite==finite,finite,float4(0.0));
 }
 float gi_denoiser_depth(Surface s) {return max(dot(p.camera.xyz-s.position,p.camera_direction.xyz),1e-6);}
+float gi_denoiser_normal_factor(Surface a,Surface b) {
+    if(!source_probe_projection()) {return pow(max(dot(a.normal,b.normal),0.0),4.0);}
+    let factor=max(dot(primary_details_normal(a),primary_details_normal(b)),0.0);
+    let squared=factor*factor;return squared*squared;
+}
 float2 gi_denoiser_moments(int2 pixel) {return unpack2x16float(asuint(moments.Load(int3(pixel,0)).x));}
 float4 gi_denoiser_accumulate(float4 lighting,float4 color,float2 uv,float alpha_blend) {
     if (color.w>0.0 || lighting.w<1.0) {lighting+=float4(color.rgb,select(color.w>0.0,1.0,-1.0));}
@@ -26,14 +31,15 @@ void reproject_gi(uint3 gid : SV_DispatchThreadID) {
     if ((p.frame.y&1u)==0u && all(old_uv>float2(0.0)) && all(old_uv<float2(1.0))) {
         var cell_size=length(p.camera.xyz-s.position)*p.reflection_thresholds.w;
         if (p.camera.w!=0.0) {cell_size=footprint(s,pixel)/float(p.screen.z);}
-        cell_size*=lerp(1.0,5.0,pow(1.0-max(dot(normalize(p.camera.xyz-s.position),s.normal),0.0),6.0));
+        let grazing_normal=surface_shading_normal(s);
+        cell_size*=lerp(1.0,5.0,pow(1.0-max(dot(normalize(p.camera.xyz-s.position),grazing_normal),0.0),6.0));
         var weight=0.0;
         for(var y=-1;y<=1;y++) {for(var x=-1;x<=1;x++) {
             let st=old_uv+float2(x,y)/float2(p.viewport.zw);
             let tap=int2(clamp(floor(st*float2(p.viewport.zw)),float2(0.0),float2(p.viewport.zw)-1.0));
             let c=previous_diffuse.Load(int3(tap,0));let normal=previous_normal.Load(int3(tap,0));let position=previous_position.Load(int3(tap,0));
             if (c.w<1.0 || position.w==0.0 || all(normal.xyz==float3(0.0))) {continue;}
-            if (length(s.position-position.xyz)<cell_size && dot(s.normal,normal.xyz)>0.95) {
+            if (length(s.position-position.xyz)<cell_size && dot(primary_details_normal(s),normal.xyz)>0.95) {
                 let subpixel=length(floor(st*float2(p.viewport.zw))+0.5-old_uv*float2(p.viewport.zw));
                 let w=clamp(1.0-subpixel*0.707107,0.0,1.0);
                 color_delta+=w*gi_denoiser_moments(tap).x;lighting+=w*c;weight+=w;
@@ -56,7 +62,7 @@ void reproject_gi(uint3 gid : SV_DispatchThreadID) {
     if (p.options.w!=0u) {
         let albedo=reflection_directional_albedo(s);
         if (s.roughness>p.reflection_filter.w) {specular=float4(lighting.rgb/max(lighting.w,1.0)*albedo,1.0);}
-        else {let reflection=reflections[reflection_full_index(2u,pixel)];specular=float4(reflection.rgb/max(reflection.w,1.0)*albedo,reflection.w);}
+        else {let reflection=reflection_load_full(2u,pixel);specular=float4(reflection.rgb/max(reflection.w,1.0)*albedo,reflection.w);}
     }
     output_diffuse[coord]=lighting;output_specular[coord]=specular;
     // Source delta/mask images are R16_FLOAT. Preserve their quantization across
@@ -76,7 +82,7 @@ void filter_gi(uint2 pixel,int2 direction) {
             let neighbor=surface(uint2(tap));let depth=gi_denoiser_depth(neighbor);
             let difference=1.0-center_depth/depth;
             let depth_factor=exp2(-select(lighting.w>0.0,200.0,20.0)*abs(difference));
-            let normal_factor=pow(max(dot(neighbor.normal,s.normal),0.0),4.0);
+            let normal_factor=gi_denoiser_normal_factor(neighbor,s);
             let w=depth_factor*select(lighting.w>0.0,normal_factor,1.0);
             color+=w*c.rgb/max(c.w,1.0);weight+=w;
         }

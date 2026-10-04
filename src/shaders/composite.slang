@@ -35,10 +35,10 @@ float4 fragment(float4 position : SV_Position) : SV_Target0 {
     let properties = unpack4x8unorm(g.z);
     var compensation = float3(1.0);
     if (p.multiplier.y != 0.0) {
-        let f0 = lerp(float3(0.16 * properties.r * properties.r),base,properties.g);
+        let f0 = primary_material_f0(base,properties.g,properties.r,uint(p.multiplier.w));
         compensation = material_compensation(g,pixel,unpack4x8unorm(g.x).a,f0);
     }
-    let material = base * (1.0 - properties.g) * compensation * properties.b;
+    let material = primary_material_albedo(base,properties.g,uint(p.multiplier.w)) * compensation * properties.b;
     let irradiance=diffuse.Load(int3(pixel,0));
     let confidence=select(p.multiplier.z!=0.0,max(irradiance.w,1.0),1.0);
     let color = irradiance.rgb/confidence * material + specular.Load(int3(pixel, 0)).rgb;

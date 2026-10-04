@@ -59,7 +59,7 @@ and release that camera's resources. Add `GiExclude` to exclude a mesh from
 secondary-ray geometry and emissive sampling while letting it receive GI.
 
 The library leaves window/platform setup to the application. Vulkan with
-`WgpuFeatures::PASSTHROUGH_SHADERS`, twelve storage buffers, four storage textures,
+`WgpuFeatures::PASSTHROUGH_SHADERS`, thirteen storage buffers, four storage textures,
 and twelve sampled textures per stage is required. Bevy's default functionality
 settings enable available adapter features; custom `WgpuSettings` must enable
 passthrough explicitly. These trusted application shaders bypass Naga's importer;
@@ -115,7 +115,8 @@ Bevy's preconvolved `EnvironmentMapLight` images. GI does not draw the skybox.
   and touched cache cells.
 - Directional hash-cache tiles with PCG/xxHash descriptors, distance/FOV-based
   sizing, 8x8/4x4/2x2/1x1 mips, half-float storage, atomic accumulation and expiry;
-  an auxiliary cache retains full material/normal/plane checks and miss fallback.
+  compensated mode adds an auxiliary cache with material/normal/plane checks and
+  miss fallback. SourceAtlas uses only the directional cache for cached lighting.
 - Separate direct/indirect estimators and extra cosine-sampled bounce rays with
   source full matte BRDF/PDF evaluation and discarded-ray survival compensation,
   using current direct light at secondary cells without recursive cache feedback.
@@ -141,6 +142,12 @@ Bevy's preconvolved `EnvironmentMapLight` images. GI does not draw the skybox.
   animation for tracing/filter jitter, endpoint/virtual-hit reprojection, firefly cleanup,
   and separable or à-trous ratio reconstruction. Directional probes replace rays
   for rough surfaces, with a smooth transition.
+  `ReflectionConfig` selects independent half/full-resolution split radii and
+  firefly controls. Unprefixed radius/threshold fields configure half resolution;
+  `full_resolution_*` fields configure full resolution, with source marking
+  radii 3/2 and cleanup radii 2/1 respectively.
+  `source_direct_lighting` maps GI-1.2's sky/emissive injection and probe-feedback
+  option in SourceAtlas, while retaining reflected indirect cache lighting.
 - Spatial probe filtering and demodulated irradiance reconstruction. The default
   diffuse denoiser uses GI-1.2's nine-tap reprojection, smoothed color delta,
   adaptive/vignetted history cap and two separable disocclusion-blur passes.
@@ -148,7 +155,10 @@ Bevy's preconvolved `EnvironmentMapLight` images. GI does not draw the skybox.
 - Depth/normal-aware diffuse gathering;
   disoccluded surfaces without suitable probes get a traced fallback sample.
 - Secondary base-color/emissive/metallic-roughness textures, UV channels and
-  transforms, normal maps, and alpha-mask candidate rejection in both backends.
+  transforms, and alpha-mask candidate rejection in both backends. SourceAtlas
+  preserves sign-corrected cofactor-transformed vertex normals until face-oriented
+  normalized interpolation at ray hits, as in GI-1.2;
+  compensated mode additionally evaluates secondary normal maps.
 - Skinning and morph deformation, with morphing before skinning. Stable topology
   refits the CPU BVH and preserves triangle identifiers; membership changes rebuild it.
 - Separate light and geometry uploads. Material shading edits preserve BVH and
@@ -215,10 +225,19 @@ Reflection reconstruction has its own configuration and four à-trous passes by 
 SourceAtlas allocates one probe per tile. In compensated mode,
 `adaptive_probes = false` releases the optional second layer. Ray capacity is fixed;
 compacted dispatches trace only valid slots. Unrepresented surfaces use the
-per-pixel fallback. The Cornell example also enables FXAA.
+per-pixel fallback in compensated mode; SourceAtlas returns black with the
+source confidence hint when no probe exists. The Cornell example also enables FXAA.
 
 At 640x640, defaults reserve 6,400 probes, 6,400 cached probes, and 409,600 probe-ray
 records. Enabling world-space reservoir reuse adds approximately 170 MB at that resolution.
+SourceAtlas also uploads an MT19937 random seed table, with a componentwise
+1920x1080 minimum (approximately 8.3 MB shared across cameras). The renderer
+retains its table when resolution shrinks and regenerates it on growth or
+source-compatible option changes. `random` defaults to
+deterministic generation with seed 5489; disabling `random.deterministic` uses
+an entropy-seeded table.
+Source visibility lists and visibility-to-shadow mappings reserve another 16
+bytes per probe ray (approximately 6.6 MB at 640x640 with default spacing).
 `WorldSpaceRestirConfig` controls its table capacity and distance/FOV footprint.
 Bevy's render-world `MainPassResolutionOverride` is supported; GI allocations,
 jitter, composition, feedback and cache footprints use the main-pass dimensions.
@@ -228,8 +247,8 @@ Reduce `hash_grid.num_buckets` for smaller caches, use coarser probe spacing, or
 lower the render resolution if allocation is rejected.
 
 Meshes must retain `RenderAssetUsages::MAIN_WORLD` for CPU BVH extraction.
-Secondary material texture sampling uses LOD zero; normal-map frames are derived
-from triangle UV gradients. Alpha blending, transmission, custom material shading,
+Secondary material texture sampling uses LOD zero; compensated normal-map frames
+are derived from triangle UV gradients. Alpha blending, transmission, custom material shading,
 and the complete StandardMaterial layer stack are not reproduced. Secondary
 scattering is diffuse; nested glossy/mirror paths,
 caustics, and unlimited bounces are not implemented. Probe/world-cache interpolation
@@ -237,15 +256,16 @@ is approximate and can blur detail or leak light despite surface rejection.
 Reflection reconstruction can blur sharp reflections and retain temporal artifacts.
 Render-world `MainPassResolutionOverride` resizes GI composition and histories.
 
-The remaining upstream differences include persistent probe eviction/update ownership,
-source visibility-ID/renderer alignment, source random seed buffers, short-ray
-multibounce bypass integration, and exact animated-surface history handling.
+The remaining upstream differences include source renderer/visibility representation,
+packed cache representation,
+and exact animated-surface history handling.
 Implemented hash-cache, grid and reflection stages still have differences in
 representation, sampling and scheduling. [The parity inventory](docs/gi12-parity.md) tracks
 these explicitly; this remains an incomplete port.
 Moving geometry performs synchronous CPU deformation/refitting, rebuilds the
-hardware scene, and resets world/persistent-probe caches while motion vectors preserve
-compatible pixel and screen-probe histories. Correct animated geometry is
+hardware scene, and retains SourceAtlas world/persistent-probe caches across
+pose-only updates. Compensated mode resets those caches; motion vectors preserve
+compatible pixel and screen-probe histories in both modes. Correct animated geometry is
 tested; stable temporal lighting and large animated scenes still need further work.
 The historical Radiance
 Cascades assessment remains in [techniques.md](docs/techniques.md).

@@ -11,6 +11,8 @@ use std::time::{Duration, Instant};
 #[ignore = "requires Vulkan and slangc"]
 fn moving_receiver_preserves_history_and_reads_bevy_motion_vectors() {
     let hardware = std::env::var("BEVY_SOL_TEST_HARDWARE").as_deref() == Ok("1");
+    let compensated = std::env::var("BEVY_SOL_TEST_COMPENSATED").as_deref() == Ok("1");
+    let source_direct_lighting = std::env::var("BEVY_SOL_TEST_SOURCE_DIRECT").as_deref() != Ok("0");
     let motion = std::env::var("BEVY_SOL_TEST_MOTION").unwrap_or_else(|_| "rigid".into());
     let mut wgpu = bevy::render::settings::WgpuSettings::default();
     if hardware {
@@ -37,12 +39,18 @@ fn moving_receiver_preserves_history_and_reads_bevy_motion_vectors() {
     })
     .add_plugins(crate::HybridGiPlugin {
         config: crate::HybridGiConfig {
+            probe_projection: if compensated {
+                crate::ProbeProjection::CompensatedRayIntegral
+            } else {
+                crate::ProbeProjection::SourceAtlas
+            },
             ray_backend: if hardware {
                 GiRayBackend::Hardware
             } else {
                 GiRayBackend::Software
             },
             sky_radiance: Vec3::ONE,
+            source_direct_lighting,
             diffuse_denoiser: if std::env::var("BEVY_SOL_TEST_DIFFUSE_MODE").as_deref()
                 == Ok("atrous")
             {
@@ -154,6 +162,38 @@ fn moving_receiver_preserves_history_and_reads_bevy_motion_vectors() {
     let world = app.sub_app_mut(RenderApp).world_mut();
     let device = world.resource::<RenderDevice>().clone();
     let queue = world.resource::<RenderQueue>().clone();
+    let view = world.query::<&ViewGi>().single(world).unwrap();
+    let cache_word = (view.tiles.x * view.tiles.y - 1) as u64
+        * (16 + probe_bytes(view.params.get().screen.w))
+        / 4;
+    let hash_word =
+        16 + view.params.get().hash_config.w + (view.params.get().hash_config.w - 1) * 4;
+    let marker_frame = view.frames;
+    // Keep markers outside visible probe candidates and ordinary hash occupancy.
+    queue.write_buffer(
+        &view.probe_cache,
+        cache_word * 4,
+        &[1u32, marker_frame, 1, u32::MAX]
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .collect::<Vec<_>>(),
+    );
+    queue.write_buffer(
+        &view.probe_cache,
+        cache_word * 4 + 16,
+        &[1e6f32.to_bits(), 0, 0, 0x1ff0_0000]
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .collect::<Vec<_>>(),
+    );
+    queue.write_buffer(
+        &view.hash_tiles,
+        u64::from(hash_word) * 4,
+        &[0x7fff_ffffu32, marker_frame, 1, 0]
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .collect::<Vec<_>>(),
+    );
     let shader = bevy_slang::SlangCompiler::default()
         .compile_source(
             "motion_history.slang",
@@ -161,12 +201,15 @@ fn moving_receiver_preserves_history_and_reads_bevy_motion_vectors() {
         [[vk::binding(0,0)]] Texture2D<float2> velocity;
         [[vk::binding(1,0)]] Texture2D<float4> history;
         [[vk::binding(2,0)]] RWStructuredBuffer<float4> result;
+        [[vk::binding(3,0)]] StructuredBuffer<uint> cache;
+        [[vk::binding(4,0)]] StructuredBuffer<uint> hash_tiles;
         [shader("compute")][numthreads(1,1,1)] void read_history() {
             let color=history.Load(int3(16,16,0));
             result[0]=float4(velocity.Load(int3(16,16,0)),color.w,color.x/max(color.w,1.0));
+            result[1]=asfloat(uint4(cache[CACHE_WORD+2],cache[CACHE_WORD+1],hash_tiles[HASH_WORD],hash_tiles[HASH_WORD+1]));
         }
     "#,
-            &bevy_slang::SlangSettings::default(),
+            &bevy_slang::SlangSettings { defines: vec![format!("CACHE_WORD={cache_word}"),format!("HASH_WORD={hash_word}")], ..default() },
         )
         .unwrap();
     let bevy::shader::Source::SpirV(bytes) = shader.source else {
@@ -192,6 +235,8 @@ fn moving_receiver_preserves_history_and_reads_bevy_motion_vectors() {
             texture_layout(0, TextureSampleType::Float { filterable: false }),
             texture_layout(1, TextureSampleType::Float { filterable: false }),
             buffer_layout(2, false, 16),
+            buffer_layout(3, true, 16),
+            buffer_layout(4, true, 16),
         ],
     );
     let pipeline_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
@@ -209,13 +254,13 @@ fn moving_receiver_preserves_history_and_reads_bevy_motion_vectors() {
     });
     let result = device.create_buffer(&BufferDescriptor {
         label: None,
-        size: 16,
+        size: 32,
         usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC,
         mapped_at_creation: false,
     });
     let staging = device.create_buffer(&BufferDescriptor {
         label: None,
-        size: 16,
+        size: 32,
         usage: BufferUsages::MAP_READ | BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
@@ -241,6 +286,14 @@ fn moving_receiver_preserves_history_and_reads_bevy_motion_vectors() {
                     binding: 2,
                     resource: result.as_entire_binding(),
                 },
+                BindGroupEntry {
+                    binding: 3,
+                    resource: view.probe_cache.as_entire_binding(),
+                },
+                BindGroupEntry {
+                    binding: 4,
+                    resource: view.hash_tiles.as_entire_binding(),
+                },
             ],
         );
         let reset = view.params.get().frame.y;
@@ -251,7 +304,7 @@ fn moving_receiver_preserves_history_and_reads_bevy_motion_vectors() {
             pass.set_bind_group(0, &group, &[]);
             pass.dispatch_workgroups(1, 1, 1);
         }
-        encoder.copy_buffer_to_buffer(&result, 0, &staging, 0, 16);
+        encoder.copy_buffer_to_buffer(&result, 0, &staging, 0, 32);
         queue.submit([encoder.finish()]);
         let (send, recv) = std::sync::mpsc::channel();
         staging
@@ -268,12 +321,30 @@ fn moving_receiver_preserves_history_and_reads_bevy_motion_vectors() {
         let values = Vec4::from_array(std::array::from_fn(|i| {
             f32::from_le_bytes(data.as_chunks::<4>().0[i])
         }));
+        let cached: [u32; 4] =
+            std::array::from_fn(|i| u32::from_le_bytes(data.as_chunks::<4>().0[i + 4]));
         drop(data);
         staging.unmap();
-        (reset, values)
+        (reset, values, cached)
     };
-    let (_, stationary) = read(&mut app);
+    let (_, stationary, _) = read(&mut app);
     assert!(stationary.z > 20.0, "warm history: {stationary}");
+    assert!(
+        stationary.to_array().iter().all(|value| value.is_finite()),
+        "non-finite warm history: {stationary}"
+    );
+    if !source_direct_lighting && !compensated {
+        // RGB10 normal and half-float filtering leave a small numerical floor.
+        assert!(
+            stationary.w.abs() < 1e-4,
+            "source sky contribution disabled: {stationary}"
+        );
+    } else {
+        assert!(
+            stationary.w > 0.1,
+            "source sky contribution enabled: {stationary}"
+        );
+    }
     for frame in 1..=12 {
         if motion == "morph" {
             app.world_mut().entity_mut(receiver).insert(
@@ -289,11 +360,22 @@ fn moving_receiver_preserves_history_and_reads_bevy_motion_vectors() {
                 .x = frame as f32 * 0.002;
         }
         app.update();
-        let (reset, moving) = read(&mut app);
+        let (reset, moving, cached) = read(&mut app);
         assert_eq!(
-            reset, 2,
-            "pose changes clear caches, preserving pixel histories"
+            reset,
+            if compensated { 2 } else { 0 },
+            "source pose changes retain caches and pixel histories"
         );
+        if compensated {
+            assert_ne!(cached[1], marker_frame, "compensated probe marker resets");
+            assert_eq!(cached[2], 0, "compensated hash marker resets");
+        } else {
+            assert_eq!(
+                cached,
+                [1, marker_frame, 0x7fff_ffff, marker_frame],
+                "source GPU cache metadata persists through motion"
+            );
+        }
         assert!(
             moving.x > 0.0001 && moving.x < 0.001,
             "receiver velocity: {moving}"

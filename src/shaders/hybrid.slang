@@ -58,6 +58,7 @@ struct CacheEntry {
     var reservoir_info: uint4;
 };
 struct RaySample {
+    // SourceAtlas uses position.w/bounce_direction.w for bit-cast visibility IDs.
     var position: float4;
     var normal: float4;
     var direction: float4;
@@ -67,6 +68,7 @@ struct RaySample {
     var bounce_normal: float4;
     var bounce_direction: float4;
     var bounce_info: uint4;
+    var probe_bounce: float4;
 };
 [[vk::binding(0, 0)]] ConstantBuffer<Params> p;
 [[vk::binding(1, 0)]] StructuredBuffer<float4> geometry;
@@ -96,7 +98,7 @@ struct RaySample {
 // Rust specializes this constant to match the configured allocation exactly.
 
 static const uint WORK_HEADER = 32u;
-static const uint TRIANGLE_WORDS = 16u;
+static const uint TRIANGLE_WORDS = 20u;
 static const float PI = 3.141592653589793;
 static const uint MISSING = 0xffffffffu;
 static const uint EMISSIVE_PROBE_RAY = 0xfffffffeu;
@@ -211,7 +213,8 @@ float3 material_albedo(float3 position, uint t) {
     return clamp(base * (1.0 - metallic) * (1.0 - 0.16 * properties.y * properties.y), float3(0.0), float3(0.99));
 }
 float3 material_emission(float3 position, uint t) {
-    return geometry[t + 7u].rgb * material_texture(uint(geometry[t + 11u].y), triangle_uv(t, barycentrics(position, t), 1u)).rgb;
+    let bary=barycentrics(position,t);
+    return geometry[t + 7u].rgb * material_texture(uint(geometry[t + 11u].y), triangle_uv(t, bary, 1u)).rgb * material_emission_alpha(t,bary);
 }
 float3 material_emission_cone(float3 receiver,float3 position,uint t,float solid_angle) {
     if(solid_angle<=0.0) {return material_emission(position,t);}
@@ -220,11 +223,47 @@ float3 material_emission_cone(float3 receiver,float3 position,uint t,float solid
     let level=area_light_cone_lod(receiver,position,geometry[t].xyz,geometry[t+1u].xyz,geometry[t+2u].xyz,
         uv0,uv1,uv2,material_texture_size(image),solid_angle);
     let value=material_texture_lod(image,triangle_uv(t,barycentrics(position,t),1u),level);
-    return safe_radiance(geometry[t+7u].rgb*value.rgb*value.a);
+    return safe_radiance(geometry[t+7u].rgb*value.rgb*value.a*material_emission_alpha(t,barycentrics(position,t)));
+}
+bool source_alpha_testing_disabled() {return (p.restir.w&9u)==9u;}
+uint material_alpha_type(uint t) {return (uint(geometry[t+12u].w)>>4u)&3u;}
+float material_alpha(uint t,float2 bary) {
+    return geometry[t+13u].a*material_texture(uint(geometry[t+11u].x),triangle_uv(t,bary,0u)).a;
+}
+float material_emission_alpha(uint t,float2 bary) {
+    return source_alpha_testing_disabled() && material_alpha_type(t)==2u ? material_alpha(t,bary) : 1.0;
+}
+float3 material_mesh_position(uint t,float2 bary) {
+    return geometry[t+16u].xyz*(1.0-bary.x-bary.y)+geometry[t+17u].xyz*bary.x+geometry[t+18u].xyz*bary.y;
+}
+uint source_alpha_hash(uint4 values) {
+    var value=values.w+374761393u+values.x*3266489917u;
+    value=668265263u*((value<<17u)|(value>>15u));
+    value+=values.y*3266489917u;
+    value=668265263u*((value<<17u)|(value>>15u));
+    value+=values.z*3266489917u;
+    value=668265263u*((value<<17u)|(value>>15u));
+    value=2246822519u*(value^(value>>15u));
+    value=3266489917u*(value^(value>>13u));
+    return value^(value>>16u);
+}
+float source_blend_threshold(uint t,float2 bary) {
+    let values=asuint(float4(material_mesh_position(t,bary),float(p.frame.x)));
+    return saturate(float(source_alpha_hash(values)>>8u)*0x1.0p-24);
 }
 bool material_visible(uint t, float2 bary) {
+    if(source_alpha_testing_disabled()) {return true;}
     let cutoff = geometry[t + 12u].z;
-    return cutoff < 0.0 || geometry[t + 13u].a * material_texture(uint(geometry[t + 11u].x), triangle_uv(t, bary, 0u)).a >= cutoff;
+    let type=material_alpha_type(t);
+    if(source_probe_projection() ? type==0u : cutoff<0.0) {return true;}
+    let alpha=material_alpha(t,bary);
+    if(!source_probe_projection()) {return alpha>=cutoff;}
+    return alpha>(type==2u ? source_blend_threshold(t,bary) : 0.5);
+}
+bool material_ray_visible(uint t,float2 bary,bool front_face) {
+    if(source_probe_projection() && !source_alpha_testing_disabled() && material_alpha_type(t)!=0u &&
+        !front_face && geometry[t+6u].w==0.0) {return false;}
+    return material_visible(t,bary);
 }
 bool hit_box(float3 o, float3 d, float3 lo, float3 hi, float near, float far) {
     var a = near; var b = far;
@@ -250,7 +289,7 @@ Hit trace_impl(float3 o, float3 d, float far, bool any_hit) {
             if (abs(det) > 1e-8) {
                 let inv = 1.0 / det; let s = o - a; let u = dot(s, h) * inv;
                 let q = cross(s, e1); let v = dot(d, q) * inv; let t = dot(e2, q) * inv;
-                if (u >= 0.0 && v >= 0.0 && u + v <= 1.0 && t >= p.cache_config.z && t < hit.distance && material_visible(index, float2(u, v))) {
+                if (u >= 0.0 && v >= 0.0 && u + v <= 1.0 && t >= p.cache_config.z && t < hit.distance && material_ray_visible(index, float2(u, v),det>0.0)) {
                     hit = Hit(t, index, float2(u, v)); if (any_hit) { return hit; }
                 }
             }
@@ -267,9 +306,11 @@ float3 geometric_normal(uint t) {
 float3 hit_normal(Hit h, float3 ray) {
     let t = h.triangle; var gn = geometric_normal(t);
     let back = dot(gn, -ray) < 0.0;
-    if (back && geometry[t + 6u].w == 0.0) { return float3(0.0); }
     var n = normalize(geometry[t + 3u].xyz * (1.0 - h.uv.x - h.uv.y)
         + geometry[t + 4u].xyz * h.uv.x + geometry[t + 5u].xyz * h.uv.y);
+    // GI-1.2 secondary hits use vertex normals, oriented by triangle facing.
+    if (source_probe_projection()) { return select(back, -n, n); }
+    if (back && geometry[t + 6u].w == 0.0) { return float3(0.0); }
     if (dot(n, gn) < 0.0) { n = -n; }
     let normal_index = uint(geometry[t + 11u].z);
     if (normal_index != 0u) {
@@ -529,6 +570,7 @@ uint descriptor_tag(int4 key) {
     return max(1u, hash32(asuint(key.x) ^ hash32(asuint(key.y) ^ hash32(asuint(key.z) ^ hash32(asuint(key.w))))));
 }
 uint cache_insert(float3 position, float3 n, float distance, uint triangle, bool primary) {
+    if(source_probe_projection()) {return MISSING;}
     let key = cell_descriptor(position, n, distance);
     let tag = max(1u, descriptor_tag(key) ^ hash32(uint(geometry[triangle + 3u].w)));
     for (var attempt = 0u; attempt < CACHE_SEARCH; attempt++) {
@@ -594,7 +636,41 @@ struct Surface {
     var reflectance: float;
     var ao: float;
     var valid: bool;
+    var geometry_normal: float3;
 };
+#ifndef GI_PRIMARY_GEOMETRY_NORMALS
+#define GI_PRIMARY_GEOMETRY_NORMALS 0
+#endif
+uint primary_normal_address(uint2 pixel) {return source_candidate_end()+pixel.x+pixel.y*p.viewport.z;}
+uint previous_primary_normal_address(uint2 pixel) {return primary_normal_address(pixel)+p.viewport.z*p.viewport.w;}
+uint primary_pack_geometry_normal(float3 normal,bool valid) {
+    if(!valid) {return 0u;}
+    let encoded=uint3(round(clamp(normal*0.5+0.5,0.0,1.0)*1023.0));
+    return encoded.x|(encoded.y<<10u)|(encoded.z<<20u)|0xc0000000u;
+}
+float3 primary_unpack_geometry_normal(uint packed) {
+    let encoded=float3(float(packed&1023u),float((packed>>10u)&1023u),float((packed>>20u)&1023u))/1023.0;
+    return normalize(encoded*2.0-1.0);
+}
+float3 surface_plane_normal(Surface s) {return select(source_probe_projection(),s.geometry_normal,s.normal);}
+float3 primary_details_normal(Surface s) {
+    if(!source_probe_projection()) {return s.normal;}
+    // Details history uses decoded shading normals without renormalizing the
+    // source R10G10B10A2_UNORM attachment.
+    let encoded=round(clamp(s.normal*0.5+0.5,0.0,1.0)*1023.0)/1023.0;
+    return encoded*2.0-1.0;
+}
+float3 surface_shading_normal(Surface s) {
+    if(source_probe_projection()) {return normalize(primary_details_normal(s));}
+    return s.normal;
+}
+float4 primary_history_details(Surface s) {
+    let value=float4(primary_details_normal(s),s.roughness);
+    if(source_probe_projection()) {return value;}
+    // The shared full-float carrier preserves source RGB10 decode precision;
+    // compensated history retains its original half-float quantization.
+    return float4(unpack2x16float(pack2x16float(value.xy)),unpack2x16float(pack2x16float(value.zw)));
+}
 float3 world_position(uint2 pixel, float z) {
     let uv = (float2(pixel) + float2(0.5)) / float2(p.viewport.zw);
     let h = mul(p.world_from_clip, float4(uv * float2(2.0, -2.0) + float2(-1.0, 1.0), z, 1.0));
@@ -606,12 +682,42 @@ float3 unpack_normal(uint packed) {
     let t = clamp(-n.z, 0.0, 1.0); n.x += select(n.x >= 0.0, -t, t); n.y += select(n.y >= 0.0, -t, t);
     return normalize(n);
 }
-Surface surface(uint2 pixel) {
+Surface surface_uncached(uint2 pixel) {
     let coord = int2(pixel + p.viewport.xy); let z = depth.Load(int3(coord, 0));
     let g = gbuffer.Load(int3(coord, 0));
     let base_rough = unpack4x8unorm(g.x); let properties = unpack4x8unorm(g.z);
-    return Surface(world_position(pixel, max(z, 1e-8)), unpack_normal(g.w), pow(base_rough.rgb, float3(2.2)),
-        base_rough.a, properties.g, properties.r, properties.b, z > 0.0 && ((g.w >> 24u) & 1u) == 0u);
+    let normal=unpack_normal(g.w);
+    var s=Surface(world_position(pixel, max(z, 1e-8)),normal,pow(base_rough.rgb,float3(2.2)),
+        base_rough.a,properties.g,properties.r,properties.b,z>0.0&&((g.w>>24u)&1u)==0u,normal);
+    return s;
+}
+Surface surface(uint2 pixel) {
+    var s=surface_uncached(pixel);
+#if GI_PRIMARY_GEOMETRY_NORMALS
+    if(source_probe_projection()&&s.valid&&all(pixel<p.viewport.zw)) {
+        let packed=work[primary_normal_address(pixel)].load();
+        if((packed>>30u)!=0u) {s.geometry_normal=primary_unpack_geometry_normal(packed);}
+    }
+#endif
+    return s;
+}
+float4 primary_geometry_normal_from_hit(Hit hit,float3 origin,float3 direction,Surface s) {
+    // The source visibility pass stores a flat, camera-facing face normal.
+    if(hit.triangle==MISSING) {return float4(s.normal,0.0);}
+    let tolerance=max(p.cache_config.z*2.0,length(s.position-origin)*1e-4);
+    if(length(origin+direction*hit.distance-s.position)>tolerance) {return float4(s.normal,0.0);}
+    var normal=geometric_normal(hit.triangle);
+    if(dot(normal,-direction)<0.0) {normal=-normal;}
+    return float4(normal,1.0);
+}
+float4 trace_primary_geometry_normal(uint2 pixel,Surface s) {
+    if(!s.valid||p.scene_info.x==0u) {return float4(s.normal,0.0);}
+    let origin=world_position(pixel,1.0);let delta=s.position-origin;
+    let distance=length(delta);
+    if(distance<=p.cache_config.z) {return float4(s.normal,0.0);}
+    let direction=delta/distance;
+    let hit=trace(origin,direction,distance+max(p.cache_config.z*2.0,distance*1e-4));
+    return primary_geometry_normal_from_hit(hit,origin,direction,s);
 }
 uint material_code(Surface s) {
     let base = uint3(round(clamp(s.base, float3(0.0), float3(1.0)) * 31.0));
@@ -649,9 +755,42 @@ float2 reproject_surface(uint2 pixel,float3 position) {
 }
 float4 feedback_radiance(float3 position, float3 n, uint triangle) {
     if (p.quality.z == 0.0) { return float4(0.0); }
+    if(!source_direct_lighting_enabled()) {return float4(0.0);}
+    if(source_probe_projection()) {return source_previous_radiance(position,n,false);}
     return visible_previous_radiance(position, n, triangle);
 }
+bool source_feedback_compatible(float3 normal,float3 previous_normal,float projected_depth,float previous_depth,bool glossy) {
+    return dot(normal,previous_normal)>select(glossy,0.95,0.5)
+        && abs(previous_depth-projected_depth)/projected_depth<select(glossy,0.01,0.05);
+}
+float previous_view_depth(float3 position) {
+    if(p.camera.w==0.0) {return mul(p.previous_clip_from_world,float4(position,1.0)).w;}
+    return dot(p.restir_sampling.xyz-position,normalize(p.previous_clip_from_world[2].xyz));
+}
+float4 source_previous_radiance(float3 position,float3 normal,bool glossy) {
+#if GI_PRIMARY_GEOMETRY_NORMALS
+    if((p.frame.y&1u)!=0u||p.reflection_thresholds.z==0.0) {return float4(0.0);}
+    let clip=probe_cache_current_clip(position);
+    if(clip.w<=0.0||clip.z/clip.w<=0.0) {return float4(0.0);}
+    let uv=clip.xy/clip.w*float2(0.5,-0.5)+0.5;
+    if(any(uv<=float2(0.0))||any(uv>=float2(1.0))) {return float4(0.0);}
+    let current_pixel=uint2(uv*float2(p.viewport.zw));
+    let previous_uv=reproject_surface(current_pixel,position);
+    if(any(previous_uv<=float2(0.0))||any(previous_uv>=float2(1.0))) {return float4(0.0);}
+    let pixel=uint2(previous_uv*float2(p.viewport.zw));
+    let packed=work[previous_primary_normal_address(pixel)].load();
+    if((packed>>30u)==0u) {return float4(0.0);}
+    let previous_normal=primary_unpack_geometry_normal(packed);
+    let previous_position_value=previous_position.Load(int3(pixel,0));
+    let projected_depth=previous_view_depth(position);
+    if(!source_feedback_compatible(normal,previous_normal,projected_depth,previous_view_depth(previous_position_value.xyz),glossy)) {return float4(0.0);}
+    return float4(previous_combined.Load(int3(pixel,0)).rgb*p.camera_direction.w,1.0);
+#else
+    return float4(0.0);
+#endif
+}
 float4 visible_previous_radiance(float3 position, float3 n, uint triangle) {
+    if(source_probe_projection()) {return source_previous_radiance(position,n,true);}
     if ((p.frame.y&1u) != 0u || p.reflection_thresholds.z == 0.0) { return float4(0.0); }
     let clip=probe_cache_current_clip(position);
     if(clip.w<=0.0) {return float4(0.0);}
@@ -674,7 +813,7 @@ float4 visible_previous_radiance(float3 position, float3 n, uint triangle) {
     let bary = barycentrics(position, triangle); let indices = geometry[triangle + 11u]; let properties = geometry[triangle + 12u];
     let base = geometry[triangle + 13u].rgb * material_texture(uint(indices.x), triangle_uv(triangle, bary, 0u)).rgb;
     let mr = material_texture(uint(indices.w), triangle_uv(triangle, bary, 3u));
-    let s = Surface(position, n, base, geometry[triangle + 7u].w * mr.g, properties.x * mr.b, properties.y, 1.0, true);
+    let s = Surface(position, n, base, geometry[triangle + 7u].w * mr.g, properties.x * mr.b, properties.y, 1.0, true,n);
     if (!history_material_matches(s, old_position.w) || abs(old_normal.w - s.roughness) > 0.08) { return float4(0.0); }
     let value = previous_combined.Load(int3(pixel, 0)).rgb * p.camera_direction.w;
     // Store reflected light only. Actual emitter radiance always bypasses the
@@ -750,12 +889,16 @@ void trace_probes(uint3 gid : SV_DispatchThreadID) {
     let index = compact_fresh_probe(lane / directions) * directions + lane % directions;
     let probe_index = index / directions; let probe_position = probes[probe_index].position; let normal = probes[probe_index].normal;
     rays[index].info = uint4(MISSING); rays[index].value = float4(0.0);
+    rays[index].probe_bounce = float4(0.0);
+    rays[index].bounce_info=uint4(MISSING);
     rays[index].position = float4(0.0); rays[index].normal = float4(0.0);
     if (probe_position.w == 0.0) { return; }
     var rng = hash32(index ^ hash32(p.frame.x));
+    if(source_probe_projection()) {rng=source_random(lane,p.frame.x);}
     let packed_pixel=probes[probe_index].info.y;
     var s=surface(uint2(packed_pixel%p.viewport.z,packed_pixel/p.viewport.z));
-    s.position=probe_position.xyz;s.normal=normal.xyz;
+    s.position=probe_position.xyz;
+    if(source_probe_projection()) {s.geometry_normal=normal.xyz;} else {s.normal=normal.xyz;}
     let sampled=probe_sample_direction(probe_index,index%directions,s,rng);let ray=sampled.xyz;
     if(sampled.w==0.0) {return;} // Below-surface GGX samples contribute zero.
     let bin=direction_bin(normal.xyz,ray);
@@ -764,23 +907,28 @@ void trace_probes(uint3 gid : SV_DispatchThreadID) {
     rays[index].direction = float4(ray, hit.distance);
     rays[index].info = uint4(MISSING, hit.triangle, bin, MISSING);
     rays[index].value.w = sampled.w;
-    if (hit.triangle == MISSING) { rays[index].value = float4(environment_radiance(ray), sampled.w); return; }
+    if (hit.triangle == MISSING) { rays[index].value = float4(source_direct_radiance(environment_radiance(ray)), sampled.w); return; }
     let n = hit_normal(hit, ray);
     if (all(n == float3(0.0))) { return; }
     let position = origin + ray * hit.distance;
     request_light_location(position);
     rays[index].position = float4(position, 1.0); rays[index].normal = float4(n, float(hit.distance < hash_cell_size(position)));
+    rays[index].info.w = hash_tile_insert(position, ray, hit.distance);
+    if(source_probe_projection()) {
+        if(rays[index].info.w==MISSING) {rays[index].info.z=MISSING;return;}
+        let query=source_append_visibility(index,false);
+        rays[index].position.w=asfloat(query);
+    }
     // GenerateReservoirs patches front-facing emissive hits directly into the
     // probe and stops transport. Testing the material emissivity, rather than
     // the sampled texel, also preserves this rule for black emission texels.
-    if(source_probe_projection() && any(geometry[hit.triangle+7u].rgb>float3(0.0)) &&
+    if(source_probe_projection() && source_direct_lighting_enabled() && any(geometry[hit.triangle+7u].rgb>float3(0.0)) &&
         dot(cross(geometry[hit.triangle+1u].xyz-geometry[hit.triangle].xyz,
             geometry[hit.triangle+2u].xyz-geometry[hit.triangle].xyz),ray)<0.0) {
         rays[index].info.x=EMISSIVE_PROBE_RAY;
         rays[index].value=float4(material_emission(position,hit.triangle),sampled.w);return;
     }
     rays[index].info.x = cache_insert(position, n, hit.distance, hit.triangle, true);
-    rays[index].info.w = hash_tile_insert(position, ray, hit.distance);
 }
 [shader("compute")][numthreads(64,1,1)]
 void trace_cache_bounces(uint3 gid : SV_DispatchThreadID) {
@@ -857,6 +1005,9 @@ void resolve_cache_bounces(uint3 gid : SV_DispatchThreadID) {
     world_cache[slot].pending_indirect = float4(value, float(info.z != 0u));
 }
 float3 cached_radiance(float3 position, float3 n, float distance, uint triangle, uint seed, uint hint, float3 direction) {
+    if(source_probe_projection()) {
+        var found=false;return directional_cached_radiance(position,direction,distance,found);
+    }
     let cell = hash_tile_find(position, direction, distance);
     if (cell != MISSING) {
         let value = hash_radiance(cell);
@@ -914,10 +1065,12 @@ void resolve_probes(uint3 gid : SV_DispatchThreadID,uint local : SV_GroupIndex) 
                     incoming=r.value.rgb;
                 } else if(r.normal.w!=0.0&&r.info.w!=MISSING) {
                     // Source short-ray visibility flag bypasses tile filtering.
-                    incoming=r.value.rgb+material_emission(r.position.xyz,r.info.y);
+                    incoming=r.value.rgb;
+                    if(!source_probe_projection()) {incoming+=material_emission(r.position.xyz,r.info.y);}
                 } else {incoming=cached_radiance(r.position.xyz,r.normal.xyz,r.direction.w,r.info.y,
                     hash32(ray_index+p.frame.x),r.info.x,r.direction.xyz);}
             }
+            if(source_probe_projection()) {incoming+=r.probe_bounce.rgb;}
             var reflected=incoming;
             if(r.info.y!=MISSING) {reflected=max(incoming-material_emission(r.position.xyz,r.info.y),float3(0.0));}
             probe_resolve_radiance[local]=float4(incoming,r.direction.w);
@@ -1018,20 +1171,15 @@ void filter_probes(uint3 gid : SV_DispatchThreadID) {
     probes[index].filtered_irradiance = float4(sum / total, center.irradiance.w);
     for (var j = 0u; j < 9u; j++) { probes[index].filtered_sh[j] = probe_pack_sh(float4(coefficients[j] / total, center.irradiance.w)); }
 }
-float4 gather_diffuse(Surface s, uint2 pixel) {
-    // InterpolateScreenProbes: nearest mask probe and three seed-relative
-    // neighbors, with duplicate rejection and normalized eighth-power weights.
-    let scale=footprint(s,pixel);
-    let cell_size=max(select(p.camera.w!=0.0,scale,
-        length(p.camera.xyz-s.position)*p.reflection_thresholds.w),p.cache_config.z*4.0);
+uint4 probe_interpolation_neighbors(Surface s,uint2 pixel,float cell_size) {
     let spawn_size=p.screen.z*(1u<<(uint(p.quality.w)>>1u));
     let samples=reflection_blue_noise(pixel,p.frame.x,1u);
     let jitter=int2((2.0*samples-1.0)*float(spawn_size));
     let new_pixel=uint2(clamp(int2(pixel)+jitter,int2(0),int2(p.viewport.zw)-1));
     let new_surface=surface(new_pixel);
     var pos=pixel;
-    if(new_surface.valid && abs(dot(new_surface.position-s.position,s.normal))<0.5*cell_size) {pos=new_pixel;}
-    var neighbors=uint[4](MISSING,MISSING,MISSING,MISSING);
+    if(new_surface.valid && abs(dot(new_surface.position-s.position,surface_plane_normal(s)))<0.5*cell_size) {pos=new_pixel;}
+    var neighbors=uint4(MISSING);
     neighbors[0]=find_closest_probe(pos,int2(0));
     if(neighbors[0]!=MISSING) {
         let packed_seed=probes[neighbors[0]].info.y;
@@ -1044,6 +1192,58 @@ float4 gather_diffuse(Surface s, uint2 pixel) {
             if(neighbors[i]==neighbors[j]) {neighbors[i]=MISSING;break;}
         }}
     }
+    return neighbors;
+}
+struct ProbeInterpolation {
+    var indices:uint4;
+    var weights:float4;
+    var hint:float;
+};
+ProbeInterpolation probe_interpolation_weights(Surface s,uint4 neighbors,float cell_size) {
+    var weights=float4(0.0);
+    if(neighbors.x==MISSING) {return ProbeInterpolation(neighbors,weights,1.0);}
+    let depth=max(dot(p.camera.xyz-s.position,p.camera_direction.xyz),1e-6);
+    for(var i=0u;i<4u;i++) {
+        if(neighbors[i]==MISSING) {continue;}
+        let probe=probes[neighbors[i]];
+        let probe_depth=max(dot(p.camera.xyz-probe.position.xyz,p.camera_direction.xyz),1e-6);
+        let normal=surface_plane_normal(s);
+        weights[i]=probe_interpolation_weight(depth,probe_depth,dot(probe.position.xyz-s.position,normal),cell_size,dot(normal,probe.normal.xyz));
+    }
+    var hint=1.0;
+    if(dot(weights,weights)==0.0) {
+        for(var i=0u;i<4u;i++) {weights[i]=float(neighbors[i]!=MISSING);}
+        hint=0.0;
+    }
+    return ProbeInterpolation(neighbors,weights/dot(weights,float4(1.0)),hint);
+}
+ProbeInterpolation source_probe_interpolation(Surface s,uint2 pixel) {
+    let cell_size=select(p.camera.w!=0.0,footprint(s,pixel),length(p.camera.xyz-s.position)*p.reflection_thresholds.w);
+    return probe_interpolation_weights(s,probe_interpolation_neighbors(s,pixel,cell_size),cell_size);
+}
+float4 source_diffuse_interpolation(Surface s,ProbeInterpolation interpolation) {
+    var value=float3(0.0);
+    for(var i=0u;i<4u;i++) {
+        if(interpolation.indices[i]!=MISSING) {value+=interpolation.weights[i]*probe_irradiance(interpolation.indices[i],s.geometry_normal);}
+    }
+    return float4(value,interpolation.hint);
+}
+float4 source_directional_interpolation(ProbeInterpolation interpolation,float3 direction) {
+    var value=float3(0.0);
+    for(var i=0u;i<4u;i++) {
+        let index=interpolation.indices[i];if(index==MISSING) {continue;}
+        let normal=probes[index].normal.xyz;
+        if(dot(direction,normal)<0.0) {continue;}
+        value+=interpolation.weights[i]*probe_unpack(probes[index].samples[direction_bin(normal,direction)]).rgb;
+    }
+    return float4(value,interpolation.hint);
+}
+float4 gather_diffuse(Surface s, uint2 pixel) {
+    if(source_probe_projection()) {return source_diffuse_interpolation(s,source_probe_interpolation(s,pixel));}
+    let scale=footprint(s,pixel);
+    let cell_size=max(select(p.camera.w!=0.0,scale,
+        length(p.camera.xyz-s.position)*p.reflection_thresholds.w),p.cache_config.z*4.0);
+    let neighbors=probe_interpolation_neighbors(s,pixel,cell_size);
     var value=float3(0.0);var total=0.0;var backup=float3(0.0);var backup_count=0u;
     let cell_count=p.screen.x*p.screen.y;
     let center_depth=max(dot(p.camera.xyz-s.position,p.camera_direction.xyz),1e-6);
@@ -1112,7 +1312,7 @@ void resolve_pixels(uint3 gid : SV_DispatchThreadID) {
     // The otherwise-unused validity channel retains a compact material signature
     // so reflected history cannot cross a coplanar material boundary under motion.
     output_position[coord] = float4(s.position, select(s.valid, float(material_code(s)), 0.0));
-    output_normal[coord] = float4(s.normal, s.roughness);
+    output_normal[coord] = primary_history_details(s);
     reflection_trace(pixel, s, hash32(pixel.x + pixel.y * p.viewport.z + hash32(p.frame.x)));
     if (!s.valid) {
         output_diffuse[coord] = float4(0.0); output_specular[coord] = float4(0.0); return;
@@ -1134,6 +1334,7 @@ void resolve_pixels(uint3 gid : SV_DispatchThreadID) {
     output_specular[coord] = float4(0.0);
 }
 float4 gather_directional(Surface s, uint2 pixel, float3 direction) {
+    if(source_probe_projection()) {return source_directional_interpolation(source_probe_interpolation(s,pixel),direction);}
     let base = int2(pixel / p.screen.z); let scale = footprint(s, pixel);
     var color = float3(0.0); var total = 0.0;
     for (var y = -1; y <= 1; y++) { for (var x = -1; x <= 1; x++) {
@@ -1155,8 +1356,8 @@ float4 gather_directional(Surface s, uint2 pixel, float3 direction) {
 }
 
 bool compatible(Surface a, Surface b, float scale) {
-    return b.valid && dot(a.normal, b.normal) > 0.95
-        && abs(dot(b.position - a.position, a.normal)) < max(scale * 0.05, p.cache_config.z * 4.0);
+    return b.valid && dot(surface_plane_normal(a), surface_plane_normal(b)) > 0.95
+        && abs(dot(b.position - a.position, surface_plane_normal(a))) < max(scale * 0.05, p.cache_config.z * 4.0);
 }
 bool same_specular_material(Surface a, Surface b) {
     return abs(a.roughness - b.roughness) < 0.08 && abs(a.metallic - b.metallic) < 0.05
@@ -1186,8 +1387,8 @@ void filter_pixels(uint3 gid : SV_DispatchThreadID) {
         for(var y=0;y<2;y++) {for(var x=0;x<2;x++) {
             let tap=base+int2(x,y);if (any(tap<int2(0)) || any(tap>=int2(p.viewport.zw))) {continue;}
             let pos=previous_position.Load(int3(tap, 0));let normal=previous_normal.Load(int3(tap, 0));
-            if (pos.w==0.0 || dot(s.normal,normal.xyz)<0.95 || length(pos.xyz-s.position)>max(scale*2.0,p.cache_config.z*4.0)
-                || abs(dot(pos.xyz-s.position,s.normal))>max(scale*0.05,p.cache_config.z*4.0)) {continue;}
+            if (pos.w==0.0 || dot(primary_details_normal(s),normal.xyz)<0.95 || length(pos.xyz-s.position)>max(scale*2.0,p.cache_config.z*4.0)
+                || abs(dot(pos.xyz-s.position,surface_plane_normal(s)))>max(scale*0.05,p.cache_config.z*4.0)) {continue;}
             let w=select(x==1, fraction.x, 1.0-fraction.x)*select(y==1, fraction.y, 1.0-fraction.y);
             old+=previous_diffuse.Load(int3(tap, 0))*w;old_m+=moments.Load(int3(tap, 0)).xy*w;history_weight+=w;
         }}
@@ -1202,7 +1403,7 @@ void filter_pixels(uint3 gid : SV_DispatchThreadID) {
     if (p.options.w!=0u) {
         let albedo=reflection_directional_albedo(s);
         if (s.roughness>p.reflection_filter.w) {specular=float4(diffuse.rgb*albedo,1.0);}
-        else {let reflection=reflections[reflection_full_index(2u,pixel)];specular=float4(reflection.rgb/max(reflection.w,1.0)*albedo,reflection.w);}
+        else {let reflection=reflection_load_full(2u,pixel);specular=float4(reflection.rgb/max(reflection.w,1.0)*albedo,reflection.w);}
     }
     output_diffuse[coord] = float4(safe_radiance(diffuse.rgb),diffuse.w);
     output_specular[coord] = float4(safe_radiance(specular.rgb),specular.w);
@@ -1226,7 +1427,7 @@ void atrous(uint2 pixel, int step) {
         if (any(tap < int2(0)) || any(tap >= int2(p.viewport.zw))) { continue; }
         let ns = surface(uint2(tap)); if (!compatible(s, ns, scale)) { continue; }
         let td = raw_diffuse.Load(int3(tap, 0)); let ts = raw_specular.Load(int3(tap, 0));
-        let nw = pow(max(dot(s.normal, ns.normal), 0.0), 32.0);
+        let nw = pow(max(dot(surface_plane_normal(s), surface_plane_normal(ns)), 0.0), 32.0);
         let w = kernel[uint(x + 2)] * kernel[uint(y + 2)] * nw;
         let wd = w * exp(-abs(luminance(td.rgb) - luminance(cd.rgb)) / ds);
         d += td.rgb * wd; dw += wd;

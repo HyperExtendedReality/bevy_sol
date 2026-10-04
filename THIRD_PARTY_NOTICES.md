@@ -10,7 +10,7 @@ and gi_denoiser.hlsl under src/core/src/render_techniques/gi1. Additional adapte
 equations come from hash.hlsl, pack.hlsl, random_number_generator.hlsl,
 material_evaluation.hlsl, material_sampling.hlsl, reservoir.hlsl,
 light_sampling.hlsl, light_sampling_volume.hlsl, light_evaluation.hlsl,
-box_sampling.hlsl, sampling/quaternion/SH helpers,
+box_sampling.hlsl, sampling/quaternion/SH/transform helpers,
 brdf_lut.comp, the light_sampler_grid_stream component, and
 blue_noise_sampler.hlsl/blue_noise_sampler_samples.h. The original blue-noise
 tables are included losslessly in src/data/gi12-blue-noise.bin. The adaptation uses

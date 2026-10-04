@@ -29,6 +29,7 @@ fn offscreen_emission_and_history_invalidation() {
     let mut app = App::new();
     let hardware = std::env::var("BEVY_SOL_TEST_HARDWARE").as_deref() == Ok("1");
     let feedback = std::env::var("BEVY_SOL_TEST_FEEDBACK").as_deref() == Ok("1");
+    let disable_alpha = std::env::var("BEVY_SOL_TEST_DISABLE_ALPHA").as_deref() == Ok("1");
     let mut wgpu = bevy::render::settings::WgpuSettings::default();
     if hardware {
         wgpu.features |= bevy::render::settings::WgpuFeatures::EXPERIMENTAL_RAY_QUERY;
@@ -89,6 +90,7 @@ fn offscreen_emission_and_history_invalidation() {
                 ..default()
             },
             temporal_feedback: feedback,
+            source_disable_alpha_testing: disable_alpha,
             reservoir_resampling: std::env::var("BEVY_SOL_TEST_RESAMPLING").as_deref() == Ok("1"),
             multibounce: !feedback,
             ray_backend: if hardware {
@@ -328,7 +330,7 @@ fn offscreen_emission_and_history_invalidation() {
         builds_before_motion
     );
     assert!(app.world().resource::<GiStatistics>().bvh_refits >= 4);
-    // Alpha-tested shadow traversal must skip a transparent blocker in both backends.
+    // Both backends skip the transparent mask unless source traversal forces opaque.
     let blocker_mesh = app
         .world_mut()
         .resource_mut::<Assets<Mesh>>()
@@ -351,7 +353,12 @@ fn offscreen_emission_and_history_invalidation() {
         .id();
     let generation = app.world().resource::<Samples>().generation;
     pump_until(&mut app, |s| {
-        s.generation > generation + 24 && s.mean > 0.08
+        s.generation > generation + 24
+            && if disable_alpha {
+                s.mean < 0.001
+            } else {
+                s.mean > 0.08
+            }
     });
     app.world_mut()
         .resource_mut::<Assets<StandardMaterial>>()

@@ -8,7 +8,8 @@ static const float3 CHECK_DIRECTIONS[14]={
 [shader("compute")][numthreads(64,1,1)]
 void check_environment(uint3 gid:SV_DispatchThreadID) {
     if(gid.x<14u) {
-        environment_checks[gid.x]=float4(environment_radiance(normalize(CHECK_DIRECTIONS[gid.x])),1.0);
+        let direction=normalize(CHECK_DIRECTIONS[gid.x]);
+        environment_checks[gid.x]=float4(environment_radiance(direction),environment_importance_pdf(direction));
     }
     var rng=hash32(gid.x+937u);
     let uv=(float2(gid.x&511u,gid.x>>9u)+float2(random(rng),random(rng)))/512.0;
@@ -16,6 +17,10 @@ void check_environment(uint3 gid:SV_DispatchThreadID) {
     let value=environment_radiance(sample.xyz)*max(dot(p.camera.xyz,sample.xyz),0.0)/(PI*sample.w);
     let evaluated=environment_pdf(p.camera.xyz,sample.xyz);
     environment_checks[14u+gid.x]=float4(value,abs(sample.w-evaluated)/max(sample.w,1e-20));
+    if(gid.x<32u) {
+        let r=float2(float(gid.x%8u)/8.0,float(gid.x/8u+1u)/6.0);
+        environment_checks[14u+262144u+gid.x]=sample_environment_importance(r);
+    }
 }
 [shader("compute")][numthreads(64,1,1)]
 void check_environment_grid(uint3 gid:SV_DispatchThreadID) {

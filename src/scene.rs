@@ -9,7 +9,7 @@ use bevy::{
     render::extract_resource::ExtractResource,
 };
 use std::{collections::HashMap, sync::Arc};
-pub(crate) const TRIANGLE_WORDS: usize = 16;
+pub(crate) const TRIANGLE_WORDS: usize = 20;
 
 /// Scene preparation counters. GPU pass durations use `RenderDiagnosticsPlugin`.
 #[derive(Resource, Default, Clone, Debug)]
@@ -33,12 +33,14 @@ pub(crate) struct GiScene {
     pub lighting_revision: u64,
     pub revision: u64,
     /// Lighting/material/topology edits invalidate pixel histories. Pose-only
-    /// refits invalidate world caches while motion vectors reproject pixels.
+    /// refits retain source caches; compensated caches are invalidated while
+    /// motion vectors reproject pixel histories in both modes.
     pub history_revision: u64,
     instances: HashMap<Entity, (AssetId<Mesh>, AssetId<StandardMaterial>, Mat4)>,
     material_membership: Vec<(AssetId<StandardMaterial>, Option<bool>)>,
     retry: bool,
     deformations: HashMap<Entity, Deformation>,
+    source_projection: Option<bool>,
 }
 #[derive(Clone)]
 pub(crate) struct Geometry {
@@ -56,6 +58,7 @@ struct Deformation {
 #[derive(Clone)]
 struct Triangle {
     vertices: [Vec3; 3],
+    mesh_vertices: [Vec3; 3],
     normals: [Vec3; 3],
     material: AssetId<StandardMaterial>,
     source: (Entity, usize),
@@ -110,6 +113,8 @@ pub(crate) fn update_scene(
     joint_transforms: Query<&GlobalTransform>,
     morph_weights: Query<&MorphWeights>,
 ) {
+    let source_projection = settings.0.probe_projection == crate::ProbeProjection::SourceAtlas;
+    let projection_changed = scene.source_projection != Some(source_projection);
     let (mut mesh_events, mut material_events, mut image_events) = events;
     let (mut removed_directional, mut removed_points, mut removed_spots, mut removed_exclusions) =
         removed;
@@ -154,9 +159,12 @@ pub(crate) fn update_scene(
         };
         deformations.insert(entity, deformation);
     }
-    let membership_changed = material_changes
+    let membership_changed = (material_changes || projection_changed)
         && scene.material_membership.iter().any(|(id, opaque)| {
-            materials.get(*id).map(|m| traceable_alpha(m.alpha_mode)) != *opaque
+            materials
+                .get(*id)
+                .map(|m| traceable_alpha(m.alpha_mode, source_projection))
+                != *opaque
         });
     let geometry_dirty = scene.data.is_none()
         || scene.retry
@@ -164,6 +172,7 @@ pub(crate) fn update_scene(
         || mesh_changes
         || membership_changed
         || exclusion_changes
+        || projection_changed
         || deformations != scene.deformations
         || query.iter().any(|(entity, m, a, t, _, _)| {
             scene.instances.get(&entity) != Some(&(m.id(), a.id(), t.to_matrix()))
@@ -178,7 +187,7 @@ pub(crate) fn update_scene(
     if !lighting_dirty {
         return;
     }
-    let mut history_dirty = mesh_changes || material_changes || image_changes;
+    let mut history_dirty = mesh_changes || material_changes || image_changes || projection_changed;
     if geometry_dirty {
         let mut triangles = Vec::new();
         let mut excluded = 0;
@@ -189,7 +198,7 @@ pub(crate) fn update_scene(
                 continue;
             };
             if mesh.primitive_topology() != PrimitiveTopology::TriangleList
-                || !traceable_alpha(mat.alpha_mode)
+                || !traceable_alpha(mat.alpha_mode, source_projection)
             {
                 excluded += 1;
                 continue;
@@ -201,8 +210,8 @@ pub(crate) fn update_scene(
                 continue;
             };
             let deformation = deformations.get(&entity);
-            let Some((world_positions, world_normals)) =
-                deform_vertices(mesh, transform.to_matrix(), deformation)
+            let Some((world_positions, world_normals, mesh_positions)) =
+                deform_vertices(mesh, transform.to_matrix(), deformation, source_projection)
             else {
                 scene.retry = true;
                 stats.error =
@@ -232,6 +241,7 @@ pub(crate) fn update_scene(
                 });
                 triangles.push(Triangle {
                     vertices,
+                    mesh_vertices: face.map(|i| mesh_positions[i]),
                     normals,
                     material: material.id(),
                     source: (entity, face_index),
@@ -295,11 +305,12 @@ pub(crate) fn update_scene(
                     material.id(),
                     materials
                         .get(&material.0)
-                        .map(|m| traceable_alpha(m.alpha_mode)),
+                        .map(|m| traceable_alpha(m.alpha_mode, source_projection)),
                 )
             })
             .collect();
         scene.deformations = deformations;
+        scene.source_projection = Some(source_projection);
     } else if material_changes && let Some(data) = &mut scene.data {
         update_materials(Arc::make_mut(data), &materials);
         stats.material_updates += 1;
@@ -470,7 +481,13 @@ fn update_materials(geometry: &mut Geometry, materials: &Assets<StandardMaterial
             AlphaMode::Mask(cutoff) => cutoff,
             _ => -1.0,
         };
-        geometry.packed[i + 12] = Vec4::new(m.metallic, m.reflectance, cutoff, channels as f32);
+        let alpha_type = match m.alpha_mode {
+            AlphaMode::Mask(_) => 1,
+            AlphaMode::Blend => 2,
+            _ => 0,
+        };
+        let flags = channels | (alpha_type << 4);
+        geometry.packed[i + 12] = Vec4::new(m.metallic, m.reflectance, cutoff, flags as f32);
         geometry.packed[i + 13] = m.base_color.to_linear().to_vec4();
         geometry.packed[i + 14] = Vec4::new(
             m.uv_transform.matrix2.x_axis.x,
@@ -487,8 +504,9 @@ fn update_materials(geometry: &mut Geometry, materials: &Assets<StandardMaterial
     }
     geometry.textures = textures;
 }
-fn traceable_alpha(alpha: AlphaMode) -> bool {
+fn traceable_alpha(alpha: AlphaMode, source: bool) -> bool {
     matches!(alpha, AlphaMode::Opaque | AlphaMode::Mask(_))
+        || (source && matches!(alpha, AlphaMode::Blend))
 }
 
 fn resolve_deformation(
@@ -531,7 +549,8 @@ fn deform_vertices(
     mesh: &Mesh,
     transform: Mat4,
     deformation: Option<&Deformation>,
-) -> Option<(Vec<Vec3>, Vec<Vec3>)> {
+    source_normals: bool,
+) -> Option<(Vec<Vec3>, Vec<Vec3>, Vec<Vec3>)> {
     let VertexAttributeValues::Float32x3(positions) = mesh.attribute(Mesh::ATTRIBUTE_POSITION)?
     else {
         return None;
@@ -543,6 +562,13 @@ fn deform_vertices(
     let morphs = mesh.morph_targets();
     let mut world_positions = Vec::with_capacity(positions.len());
     let mut world_normals = Vec::with_capacity(positions.len());
+    let mut mesh_positions = Vec::with_capacity(positions.len());
+    let skinned = deformation.is_some_and(|d| !d.joints.is_empty());
+    let instance_inverse = if skinned {
+        transform.inverse()
+    } else {
+        Mat4::IDENTITY
+    };
     for (vertex, position) in positions.iter().enumerate() {
         let mut position = Vec3::from(*position);
         let mut normal = normals
@@ -581,11 +607,38 @@ fn deform_vertices(
                 }
             }
         }
+        let mesh_position = if skinned {
+            (instance_inverse * world).transform_point3(position)
+        } else {
+            position
+        };
+        if !mesh_position.is_finite() {
+            return None;
+        }
+        mesh_positions.push(mesh_position);
         world_positions.push(world.transform_point3(position));
-        world_normals
-            .push((Mat3::from_mat4(world).inverse().transpose() * normal).normalize_or_zero());
+        let matrix = Mat3::from_mat4(world);
+        world_normals.push(if source_normals {
+            // Capsaicin getNormalTransform omits the determinant magnitude.
+            let cofactor = Mat3::from_cols(
+                matrix.y_axis.cross(matrix.z_axis),
+                matrix.z_axis.cross(matrix.x_axis),
+                matrix.x_axis.cross(matrix.y_axis),
+            );
+            let determinant = matrix.x_axis.dot(cofactor.x_axis);
+            let sign = if determinant > 0.0 {
+                1.0
+            } else if determinant < 0.0 {
+                -1.0
+            } else {
+                0.0
+            };
+            cofactor * normal * sign
+        } else {
+            (matrix.inverse().transpose() * normal).normalize_or_zero()
+        });
     }
-    Some((world_positions, world_normals))
+    Some((world_positions, world_normals, mesh_positions))
 }
 
 /// Preserve leaf ordering and refit bounds when topology and membership match.
@@ -608,6 +661,7 @@ fn refit_geometry(old: &Geometry, triangles: &[Triangle]) -> Option<Geometry> {
             geometry.packed[offset + 3 + i] =
                 triangle.normals[i].extend(geometry.packed[offset + 3 + i].w);
             geometry.packed[offset + 8 + i] = triangle.uvs[i];
+            geometry.packed[offset + 16 + i] = triangle.mesh_vertices[i].extend(0.0);
         }
     }
     for node in (0..old.node_count as usize).rev() {
@@ -660,6 +714,8 @@ fn pack_geometry(mut triangles: Vec<Triangle>) -> Geometry {
         packed.extend([Vec4::ZERO, Vec4::ZERO]);
         packed.extend(t.uvs);
         packed.extend([Vec4::ZERO; 5]);
+        packed.extend(t.mesh_vertices.map(|v| v.extend(0.0)));
+        packed.push(Vec4::ZERO);
     }
     if packed.is_empty() {
         packed.push(Vec4::ZERO);
@@ -759,6 +815,134 @@ fn alias_table(weights: &[f64]) -> Vec<Vec3> {
 mod tests {
     use super::*;
     #[test]
+    fn mesh_buffer_positions_exclude_instance_transform_and_include_morphs() {
+        let mut mesh = Mesh::new(
+            PrimitiveTopology::TriangleList,
+            bevy::asset::RenderAssetUsages::MAIN_WORLD,
+        );
+        mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, vec![[1.0, 2.0, 3.0]]);
+        mesh.set_morph_targets(vec![bevy::mesh::morph::MorphAttributes::new(
+            Vec3::new(2.0, -4.0, 6.0),
+            Vec3::ZERO,
+            Vec3::ZERO,
+        )]);
+        let transform = Mat4::from_scale_rotation_translation(
+            Vec3::new(-2.0, 3.0, 0.5),
+            Quat::from_rotation_y(0.7),
+            Vec3::splat(100.0),
+        );
+        for weight in [0.0, 0.5, 1.0] {
+            let deformation = Deformation {
+                joints: Vec::new(),
+                weights: vec![weight],
+            };
+            let expected = Vec3::new(1.0, 2.0, 3.0) + Vec3::new(2.0, -4.0, 6.0) * weight;
+            for source in [false, true] {
+                let (world, _, local) =
+                    deform_vertices(&mesh, transform, Some(&deformation), source).unwrap();
+                assert_eq!(local[0], expected);
+                assert_eq!(world[0], transform.transform_point3(expected));
+            }
+        }
+        let (_, _, local) = deform_vertices(&mesh, transform, None, true).unwrap();
+        assert_eq!(local[0], Vec3::new(1.0, 2.0, 3.0));
+    }
+    #[test]
+    fn mesh_buffer_packet_refits_preserve_material_and_emitter_metadata() {
+        let mut triangle = Triangle {
+            vertices: [Vec3::ZERO, Vec3::X, Vec3::Y],
+            mesh_vertices: [Vec3::splat(10.0), Vec3::splat(20.0), Vec3::splat(30.0)],
+            normals: [Vec3::Z; 3],
+            material: AssetId::default(),
+            source: (Entity::PLACEHOLDER, 0),
+            uvs: [Vec4::ZERO; 3],
+        };
+        let mut before = pack_geometry(vec![triangle.clone()]);
+        let offset = before.materials[0].1 as usize;
+        assert_eq!(before.packed.len(), offset + TRIANGLE_WORDS);
+        for i in 0..3 {
+            assert_eq!(
+                before.packed[offset + 16 + i],
+                triangle.mesh_vertices[i].extend(0.0)
+            );
+        }
+        before.packed[offset].w = 7.0;
+        before.packed[offset + 6] = Vec4::splat(0.25);
+        triangle.vertices = triangle.vertices.map(|v| v + Vec3::splat(100.0));
+        triangle.mesh_vertices = triangle.mesh_vertices.map(|v| v + Vec3::Y);
+        let after = refit_geometry(&before, &[triangle.clone()]).unwrap();
+        for i in 0..3 {
+            assert_eq!(after.packed[offset + i].truncate(), triangle.vertices[i]);
+            assert_eq!(
+                after.packed[offset + 16 + i],
+                triangle.mesh_vertices[i].extend(0.0)
+            );
+            assert_eq!(
+                after.packed[offset + 3 + i].w,
+                before.packed[offset + 3 + i].w
+            );
+        }
+        assert_eq!(after.packed[offset].w, 7.0);
+        assert_eq!(after.packed[offset + 6], before.packed[offset + 6]);
+        assert_eq!(after.packed[offset + 19], Vec4::ZERO);
+        assert_eq!(after.packed[0].truncate(), Vec3::splat(100.0));
+        assert_eq!(after.packed[1].truncate(), Vec3::new(101.0, 101.0, 100.0));
+    }
+    #[test]
+    fn source_normals_preserve_cofactor_magnitudes_until_hit_interpolation() {
+        let mut mesh = Mesh::new(
+            PrimitiveTopology::TriangleList,
+            bevy::asset::RenderAssetUsages::MAIN_WORLD,
+        );
+        mesh.insert_attribute(
+            Mesh::ATTRIBUTE_POSITION,
+            vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+        );
+        mesh.insert_attribute(
+            Mesh::ATTRIBUTE_NORMAL,
+            vec![[0.0, 0.0, 1.0], [0.6, 0.0, 0.8], [0.0, 0.8, 0.6]],
+        );
+        for (scale, angle) in [
+            (Vec3::new(2.0, 1.0, 0.5), 0.0),
+            (Vec3::new(-2.0, 1.0, 0.5), 0.0),
+            (Vec3::new(2.0, 1.0, 0.5), 0.7),
+            (Vec3::new(-2.0, 1.0, 0.5), 0.7),
+        ] {
+            let transform = Mat4::from_scale_rotation_translation(
+                scale,
+                Quat::from_rotation_y(angle) * Quat::from_rotation_z(angle * 0.3),
+                Vec3::new(3.0, 2.0, 1.0),
+            );
+            let (_, normals, _) = deform_vertices(&mesh, transform, None, true).unwrap();
+            let matrix =
+                Mat3::from_mat4(transform).inverse().transpose() * scale.element_product().abs();
+            let local = [Vec3::Z, Vec3::new(0.6, 0.0, 0.8), Vec3::new(0.0, 0.8, 0.6)];
+            for (actual, local) in normals.iter().zip(local) {
+                assert!(actual.abs_diff_eq(matrix * local, 1e-6));
+            }
+            let interpolated =
+                (normals[0] * 0.25 + normals[1] * 0.25 + normals[2] * 0.5).normalize();
+            let expected =
+                (matrix * (local[0] * 0.25 + local[1] * 0.25 + local[2] * 0.5)).normalize();
+            assert!(interpolated.abs_diff_eq(expected, 1e-6));
+            let (_, compensated, _) = deform_vertices(&mesh, transform, None, false).unwrap();
+            let previous =
+                (compensated[0] * 0.25 + compensated[1] * 0.25 + compensated[2] * 0.5).normalize();
+            assert!(interpolated.distance(previous) > 0.01);
+            let geometry = pack_geometry(vec![Triangle {
+                vertices: [Vec3::ZERO, Vec3::X, Vec3::Y],
+                mesh_vertices: [Vec3::ZERO, Vec3::X, Vec3::Y],
+                normals: normals.try_into().unwrap(),
+                material: AssetId::default(),
+                source: (Entity::PLACEHOLDER, 0),
+                uvs: [Vec4::ZERO; 3],
+            }]);
+            for (packed, expected) in geometry.packed[5..8].iter().zip(local.map(|n| matrix * n)) {
+                assert!(packed.truncate().abs_diff_eq(expected, 1e-6));
+            }
+        }
+    }
+    #[test]
     fn morph_then_skin_matches_world_positions_and_inverse_transpose_normals() {
         let mut mesh = Mesh::new(
             PrimitiveTopology::TriangleList,
@@ -785,16 +969,22 @@ mod tests {
             joints: vec![world],
             weights: vec![0.5],
         };
-        let (positions, normals) = deform_vertices(
+        let (positions, normals, mesh_positions) = deform_vertices(
             &mesh,
             Mat4::from_translation(Vec3::splat(100.0)),
             Some(&deformation),
+            false,
         )
         .unwrap();
         assert!(positions[0].distance(world.transform_point3(Vec3::new(1.0, 0.5, 0.0))) < 1e-5);
         let expected =
             (Mat3::from_mat4(world).inverse().transpose() * Vec3::new(1.0, 1.0, 0.5)).normalize();
         assert!(normals[0].distance(expected) < 1e-5);
+        let mesh_skin = Mat4::from_translation(Vec3::splat(-100.0)) * world;
+        assert!(
+            mesh_positions[0]
+                .abs_diff_eq(mesh_skin.transform_point3(Vec3::new(1.0, 0.5, 0.0)), 1e-5)
+        );
         assert!(
             deform_vertices(
                 &mesh,
@@ -802,7 +992,8 @@ mod tests {
                 Some(&Deformation {
                     joints: vec![world],
                     weights: vec![1.0, 1.0]
-                })
+                }),
+                false,
             )
             .is_none()
         );
@@ -905,6 +1096,11 @@ mod tests {
     #[test]
     fn shading_edits_preserve_geometry_and_membership_edits_rebuild_it() {
         let (mut app, mesh, material) = scene_app();
+        app.world_mut()
+            .resource_mut::<GiSettings>()
+            .0
+            .probe_projection = crate::ProbeProjection::CompensatedRayIntegral;
+        app.update();
         assert_eq!(app.world().resource::<GiStatistics>().triangles, 12);
         let point = app
             .world_mut()
@@ -961,6 +1157,44 @@ mod tests {
         app.world_mut().entity_mut(mesh).remove::<GiExclude>();
         app.update();
         assert_eq!(app.world().resource::<GiStatistics>().triangles, 12);
+    }
+    #[test]
+    fn source_blends_are_extracted_and_projection_changes_update_membership() {
+        let (mut app, _, material) = scene_app();
+        app.world_mut()
+            .resource_mut::<Assets<StandardMaterial>>()
+            .get_mut(&material)
+            .unwrap()
+            .alpha_mode = AlphaMode::Blend;
+        app.world_mut()
+            .write_message(AssetEvent::Modified { id: material.id() });
+        app.update();
+        assert_eq!(app.world().resource::<GiStatistics>().triangles, 12);
+        let geometry = app.world().resource::<GiScene>().data.as_ref().unwrap();
+        for &(_, offset) in &geometry.materials {
+            assert_eq!(geometry.packed[offset as usize + 12].w as u32 >> 4, 2);
+        }
+        for (projection, triangles) in [
+            (crate::ProbeProjection::CompensatedRayIntegral, 0),
+            (crate::ProbeProjection::SourceAtlas, 12),
+        ] {
+            let history = app.world().resource::<GiScene>().history_revision;
+            app.world_mut()
+                .resource_mut::<GiSettings>()
+                .0
+                .probe_projection = projection;
+            app.update();
+            assert_eq!(app.world().resource::<GiStatistics>().triangles, triangles);
+            assert!(app.world().resource::<GiScene>().history_revision > history);
+        }
+        for mode in [
+            AlphaMode::Add,
+            AlphaMode::Multiply,
+            AlphaMode::Premultiplied,
+        ] {
+            assert!(!traceable_alpha(mode, true));
+            assert!(!traceable_alpha(mode, false));
+        }
     }
     #[test]
     fn triangle_limit_retains_a_complete_scene_and_recovers() {
@@ -1081,11 +1315,56 @@ mod tests {
         }
     }
     #[test]
+    fn material_mask_type_is_independent_of_cutoff_and_uv_channels() {
+        for alpha_mode in [
+            AlphaMode::Opaque,
+            AlphaMode::Mask(-1.0),
+            AlphaMode::Mask(0.5),
+            AlphaMode::Mask(f32::NAN),
+            AlphaMode::Blend,
+        ] {
+            let mut materials = Assets::<StandardMaterial>::default();
+            let material = materials.add(StandardMaterial {
+                alpha_mode,
+                base_color_channel: bevy::mesh::UvChannel::Uv1,
+                emissive_channel: bevy::mesh::UvChannel::Uv1,
+                metallic_roughness_channel: bevy::mesh::UvChannel::Uv1,
+                ..default()
+            });
+            let mut geometry = pack_geometry(vec![Triangle {
+                vertices: [Vec3::ZERO, Vec3::X, Vec3::Y],
+                mesh_vertices: [Vec3::ZERO, Vec3::X, Vec3::Y],
+                normals: [Vec3::Z; 3],
+                material: material.id(),
+                source: (Entity::PLACEHOLDER, 0),
+                uvs: [Vec4::ZERO; 3],
+            }]);
+            update_materials(&mut geometry, &materials);
+            let packed = geometry.packed[geometry.materials[0].1 as usize + 12];
+            let cutoff = if let AlphaMode::Mask(cutoff) = alpha_mode {
+                cutoff
+            } else {
+                -1.0
+            };
+            assert_eq!(packed.z.to_bits(), cutoff.to_bits());
+            assert_eq!(packed.w as u32 & 15, 11);
+            assert_eq!(
+                packed.w as u32 >> 4,
+                match alpha_mode {
+                    AlphaMode::Mask(_) => 1,
+                    AlphaMode::Blend => 2,
+                    _ => 0,
+                }
+            );
+        }
+    }
+    #[test]
     fn bvh_leaf_offsets_and_escape_indices_are_valid() {
         let mut materials = Assets::<StandardMaterial>::default();
         let material = materials.add(StandardMaterial::default());
         let t = Triangle {
             vertices: [Vec3::ZERO, Vec3::X, Vec3::Y],
+            mesh_vertices: [Vec3::ZERO, Vec3::X, Vec3::Y],
             normals: [Vec3::Z; 3],
             material: material.id(),
             source: (Entity::PLACEHOLDER, 0),
@@ -1095,7 +1374,7 @@ mod tests {
         assert_eq!(geometry.node_count, 3);
         assert_eq!(geometry.packed[1].w, 3.0);
         assert_eq!(geometry.packed[2].w, 6.0);
-        assert_eq!(geometry.packed[4].w, 22.0);
+        assert_eq!(geometry.packed[4].w, 26.0);
         assert_eq!(pack_geometry(Vec::new()).node_count, 0);
     }
 }

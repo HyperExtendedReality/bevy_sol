@@ -6,6 +6,7 @@ mod environment;
 mod gpu;
 mod hash_grid;
 mod light_grid;
+mod random;
 mod raytracing;
 mod reflections;
 mod restir;
@@ -23,6 +24,7 @@ use bevy::{
 pub use environment::{EnvironmentSampling, GiEnvironmentMap};
 pub use hash_grid::HashGridCacheConfig;
 pub use light_grid::{LightGridConfig, LightGridMerge};
+pub use random::RandomConfig;
 pub use reflections::{ReflectionConfig, ReflectionDenoiser};
 pub use restir::WorldSpaceRestirConfig;
 pub use scene::GiStatistics;
@@ -97,6 +99,7 @@ impl Default for HybridGi {
 #[derive(Clone, Debug)]
 pub struct HybridGiConfig {
     pub probe_projection: ProbeProjection,
+    pub random: RandomConfig,
     /// Slang compiler invoked once during shader initialization. Uses SLANGC/PATH by default.
     pub slang_compiler: bevy_slang::SlangCompiler,
     pub ray_backend: GiRayBackend,
@@ -128,6 +131,15 @@ pub struct HybridGiConfig {
     pub sky_radiance: Vec3,
     /// Explicit extra transport bounce between world-cache cells.
     pub multibounce: bool,
+    /// GI-1.2 direct probe/glossy emission and environment contributions, and probe feedback.
+    /// SourceAtlas only; does not disable cached indirect lighting or Bevy direct lighting.
+    pub source_direct_lighting: bool,
+    /// Source final-composition override: diffuse albedo 0.3 and specular F0 zero.
+    /// Secondary material evaluation is unchanged. Ignored in compensated mode.
+    pub source_disable_albedo_textures: bool,
+    /// Force opaque GI closest-hit and shadow traversal in SourceAtlas.
+    /// Bevy's primary raster alpha testing is unchanged. Ignored in compensated mode.
+    pub source_disable_alpha_testing: bool,
     /// 1..=8 weighted next-event samples per receiver pixel and uncached shading.
     pub direct_samples: u32,
     /// Enable temporal/spatial reuse of the streamed-grid light reservoirs.
@@ -154,6 +166,7 @@ impl Default for HybridGiConfig {
     fn default() -> Self {
         Self {
             probe_projection: ProbeProjection::default(),
+            random: RandomConfig::default(),
             slang_compiler: bevy_slang::SlangCompiler::default(),
             ray_backend: GiRayBackend::Auto,
             hash_grid: HashGridCacheConfig::default(),
@@ -172,6 +185,9 @@ impl Default for HybridGiConfig {
             ray_bias: 0.002,
             sky_radiance: Vec3::ZERO,
             multibounce: true,
+            source_direct_lighting: true,
+            source_disable_albedo_textures: false,
+            source_disable_alpha_testing: false,
             direct_samples: 4,
             reservoir_resampling: false,
             world_space_restir: WorldSpaceRestirConfig::default(),

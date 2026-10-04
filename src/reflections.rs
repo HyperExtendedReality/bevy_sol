@@ -17,12 +17,21 @@ pub struct ReflectionConfig {
     pub denoiser: ReflectionDenoiser,
     pub high_roughness_threshold: f32,
     pub atrous_passes: u32,
+    /// Half-resolution split-estimator radius, measured in full-resolution pixels.
     pub split_radius: u32,
+    pub full_resolution_split_radius: u32,
     pub cleanup_fireflies: bool,
+    /// Half-resolution marking radius, measured in full-resolution pixels.
     pub mark_fireflies_radius: u32,
+    pub full_resolution_mark_fireflies_radius: u32,
+    /// Half-resolution cleanup radius, measured in sample-grid pixels in SourceAtlas.
     pub cleanup_fireflies_radius: u32,
+    pub full_resolution_cleanup_fireflies_radius: u32,
+    /// Half-resolution marking thresholds.
     pub firefly_low_threshold: f32,
     pub firefly_high_threshold: f32,
+    pub full_resolution_firefly_low_threshold: f32,
+    pub full_resolution_firefly_high_threshold: f32,
 }
 impl Default for ReflectionConfig {
     fn default() -> Self {
@@ -32,26 +41,62 @@ impl Default for ReflectionConfig {
             high_roughness_threshold: 0.6,
             atrous_passes: 4,
             split_radius: 11,
+            full_resolution_split_radius: 11,
             cleanup_fireflies: true,
             mark_fireflies_radius: 3,
+            full_resolution_mark_fireflies_radius: 2,
             cleanup_fireflies_radius: 2,
+            full_resolution_cleanup_fireflies_radius: 1,
             firefly_low_threshold: 0.0,
             firefly_high_threshold: 1.0,
+            full_resolution_firefly_low_threshold: 0.0,
+            full_resolution_firefly_high_threshold: 1.0,
         }
     }
 }
 impl ReflectionConfig {
+    pub(crate) fn reconstruction_settings(&self) -> ([u32; 3], [f32; 2]) {
+        if self.half_resolution {
+            (
+                [
+                    self.split_radius,
+                    self.mark_fireflies_radius,
+                    self.cleanup_fireflies_radius,
+                ],
+                [self.firefly_low_threshold, self.firefly_high_threshold],
+            )
+        } else {
+            (
+                [
+                    self.full_resolution_split_radius,
+                    self.full_resolution_mark_fireflies_radius,
+                    self.full_resolution_cleanup_fireflies_radius,
+                ],
+                [
+                    self.full_resolution_firefly_low_threshold,
+                    self.full_resolution_firefly_high_threshold,
+                ],
+            )
+        }
+    }
     pub(crate) fn validate(&self, low: f32) -> Result<(), &'static str> {
         if !self.high_roughness_threshold.is_finite()
             || !(low..=1.0).contains(&self.high_roughness_threshold)
             || !(2..=8).contains(&self.atrous_passes)
             || !(1..=32).contains(&self.split_radius)
+            || !(1..=32).contains(&self.full_resolution_split_radius)
             || self.mark_fireflies_radius > 16
+            || self.full_resolution_mark_fireflies_radius > 16
             || self.cleanup_fireflies_radius > 16
+            || self.full_resolution_cleanup_fireflies_radius > 16
             || !self.firefly_low_threshold.is_finite()
             || !self.firefly_high_threshold.is_finite()
             || !(0.0..=1.0).contains(&self.firefly_low_threshold)
             || !(0.0..=1.0).contains(&self.firefly_high_threshold)
+            || !self.full_resolution_firefly_low_threshold.is_finite()
+            || !self.full_resolution_firefly_high_threshold.is_finite()
+            || !(0.0..=1.0).contains(&self.full_resolution_firefly_low_threshold)
+            || !(0.0..=1.0).contains(&self.full_resolution_firefly_high_threshold)
         {
             return Err("invalid reflection thresholds or reconstruction settings");
         }
@@ -77,6 +122,65 @@ impl ReflectionConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn source_resolution_defaults_and_independent_controls() {
+        let mut config = ReflectionConfig::default();
+        assert_eq!(config.reconstruction_settings(), ([11, 3, 2], [0.0, 1.0]));
+        config.half_resolution = false;
+        assert_eq!(config.reconstruction_settings(), ([11, 2, 1], [0.0, 1.0]));
+        config.split_radius = 7;
+        config.mark_fireflies_radius = 5;
+        config.cleanup_fireflies_radius = 4;
+        config.firefly_low_threshold = 0.1;
+        config.firefly_high_threshold = 0.9;
+        config.full_resolution_split_radius = 9;
+        config.full_resolution_mark_fireflies_radius = 6;
+        config.full_resolution_cleanup_fireflies_radius = 3;
+        config.full_resolution_firefly_low_threshold = 0.2;
+        config.full_resolution_firefly_high_threshold = 0.8;
+        assert_eq!(config.reconstruction_settings(), ([9, 6, 3], [0.2, 0.8]));
+        config.half_resolution = true;
+        assert_eq!(config.reconstruction_settings(), ([7, 5, 4], [0.1, 0.9]));
+        assert!(config.validate(0.2).is_ok());
+    }
+
+    #[test]
+    fn rejects_invalid_inactive_resolution_controls() {
+        let config = ReflectionConfig::default();
+        for invalid in [
+            ReflectionConfig {
+                full_resolution_split_radius: 0,
+                ..config.clone()
+            },
+            ReflectionConfig {
+                full_resolution_mark_fireflies_radius: 17,
+                ..config.clone()
+            },
+            ReflectionConfig {
+                full_resolution_cleanup_fireflies_radius: 17,
+                ..config.clone()
+            },
+            ReflectionConfig {
+                full_resolution_firefly_low_threshold: f32::NAN,
+                ..config.clone()
+            },
+            ReflectionConfig {
+                full_resolution_firefly_high_threshold: f32::INFINITY,
+                ..config.clone()
+            },
+            ReflectionConfig {
+                full_resolution_firefly_low_threshold: -0.1,
+                ..config.clone()
+            },
+            ReflectionConfig {
+                full_resolution_firefly_high_threshold: 1.1,
+                ..config
+            },
+        ] {
+            assert!(invalid.validate(0.2).is_err());
+        }
+    }
 
     #[test]
     fn original_blue_noise_tables_are_preserved() {

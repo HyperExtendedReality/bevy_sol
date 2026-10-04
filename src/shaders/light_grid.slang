@@ -148,6 +148,7 @@ void build_light_grid(uint3 gid : SV_DispatchThreadID) {
     if (lane>=count || dims.w==0u) {return;}
     let reservoir=lane%dims.w;
     let increment=(p.frame.x<<1u)|1u;var rng=(pcg_hash(lane)+increment)*747796405u+increment;
+    if(source_probe_projection()) {rng=source_random(lane,p.frame.x);}
     var selected=MISSING;var selected_weight=0.0;var total=0.0;var j=grid_random(rng);var none_probability=1.0;
     for(var light=reservoir;light<grid_light_count();light+=dims.w) {
         let weight=grid_reservoir_weight(lane,light);if (!(weight>0.0)) {continue;}
@@ -165,17 +166,43 @@ void build_light_grid_parallel(uint3 group : SV_GroupID,uint thread : SV_GroupIn
     let lane=group.x+group.y*65535u;let dims=grid_dimensions();let count=dims.x*dims.y*dims.z*dims.w*grid_faces();
     if (lane>=count || dims.w==0u) {return;}
     var rng=pcg_hash(lane*128u+thread+p.frame.x);
+    if(source_probe_projection()) {rng=source_random(lane,p.frame.x);}
     var selected=MISSING;var selected_weight=0.0;var total=0.0;var j=grid_random(rng);var none_probability=1.0;
     for(var light=lane%dims.w+thread*dims.w;light<grid_light_count();light+=128u*dims.w) {
         let weight=grid_reservoir_weight(lane,light);if (!(weight>0.0)) {continue;}
         total+=weight;let probability=weight/total;j-=probability*none_probability;none_probability*=1.0-probability;
         if (j<=0.0) {selected=light;selected_weight=weight;j=grid_random(rng);none_probability=1.0;}
     }
-    grid_partial_light[thread]=selected;grid_partial_target[thread]=selected_weight;grid_partial_total[thread]=total;
-    GroupMemoryBarrierWithGroupSync();
-    if (thread!=0u) {return;}
+    var partial_count=128u;
+    if(source_probe_projection()) {
+        let cdf=WavePrefixSum(total)+total;
+        total=WaveActiveSum(total);j=grid_random(rng);
+        let valid=j*total<=cdf;
+        let first=WavePrefixCountBits(valid);
+        let winner=valid && first==0u;
+        let wave_size=WaveGetLaneCount();
+        if(wave_size==128u) {
+            if(winner) {
+                let address=24u+lane*4u;light_grid[address].store(selected);
+                light_grid[address+1u].store(asuint(selected_weight));light_grid[address+2u].store(asuint(total));
+            }
+            return;
+        }
+        let wave=thread/wave_size;
+        if(winner) {
+            grid_partial_light[wave]=selected;grid_partial_target[wave]=selected_weight;grid_partial_total[wave]=total;
+        }
+        // Unlike the source's early return, every lane reaches the group barrier.
+        GroupMemoryBarrierWithGroupSync();
+        if(!winner || wave!=0u) {return;}
+        partial_count=128u/wave_size;
+    } else {
+        grid_partial_light[thread]=selected;grid_partial_target[thread]=selected_weight;grid_partial_total[thread]=total;
+        GroupMemoryBarrierWithGroupSync();
+        if (thread!=0u) {return;}
+    }
     selected=MISSING;selected_weight=0.0;total=0.0;j=grid_random(rng);none_probability=1.0;
-    for(var i=0u;i<128u;i++) {
+    for(var i=0u;i<partial_count;i++) {
         let weight=grid_partial_total[i];if (!(weight>0.0)) {continue;}
         total+=weight;let probability=weight/total;j-=probability*none_probability;none_probability*=1.0-probability;
         if (j<=0.0) {selected=grid_partial_light[i];selected_weight=grid_partial_target[i];j=grid_random(rng);none_probability=1.0;}

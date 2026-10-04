@@ -74,6 +74,118 @@ fn reference(pixels: &[[Vec3; 16]; 6], rotation: Quat, sky: Vec3, scale: f32) ->
     (sum / (steps * steps) as f64).as_vec3()
 }
 
+fn source_pdf(pixels: &[[Vec3; 16]; 6], direction: Vec3, sky: Vec3, scale: f32) -> f32 {
+    let luminance = |v: Vec3| v.dot(Vec3::new(0.2126, 0.7152, 0.0722));
+    let sum: f32 = pixels
+        .iter()
+        .map(|face| luminance(sky + scale * face.iter().copied().sum::<Vec3>() / 16.0))
+        .sum();
+    if sum <= 1e-20 {
+        return 1.0 / std::f32::consts::TAU / 2.0;
+    }
+    let a = direction.abs();
+    let normal = if a.z >= a.x && a.z >= a.y {
+        Vec3::Z * direction.z.signum()
+    } else if a.y >= a.x {
+        Vec3::Y * direction.y.signum()
+    } else {
+        Vec3::X * direction.x.signum()
+    };
+    let up = if normal.y.abs() > 0.999 {
+        Vec3::Z * normal.y
+    } else {
+        Vec3::Y
+    };
+    let right = -up.cross(normal);
+    let cosine = normal.dot(direction);
+    let uv =
+        Vec2::new(right.dot(direction), -up.dot(direction)) * (0.5 / cosine) + Vec2::splat(0.5);
+    let snapped = ((uv * 4.0).ceil() - Vec2::splat(0.5)) / 4.0;
+    let texel_direction = normal + right * (snapped.x * 2.0 - 1.0) + up * (1.0 - snapped.y * 2.0);
+    luminance(sky + scale * lookup(pixels, texel_direction)) / sum / (4.0 * cosine.powi(3))
+}
+
+fn source_sample(pixels: &[[Vec3; 16]; 6], sky: Vec3, mut r: Vec2) -> Vec4 {
+    let faces = [Vec3::X, -Vec3::X, Vec3::Y, -Vec3::Y, Vec3::Z, -Vec3::Z];
+    let mut levels = vec![*pixels];
+    for width in [2, 1] {
+        let previous = levels.last().unwrap();
+        levels.push(std::array::from_fn(|face| {
+            std::array::from_fn(|pixel| {
+                let x = pixel % 4 / (4 / width) * (4 / width);
+                let y = pixel / 4 / (4 / width) * (4 / width);
+                let step = 2 / width;
+                (previous[face][x + 4 * y]
+                    + previous[face][x + step + 4 * y]
+                    + previous[face][x + 4 * (y + step)]
+                    + previous[face][x + step + 4 * (y + step)])
+                    * 0.25
+            })
+        }));
+    }
+    let luminance = |v: Vec3| v.dot(Vec3::new(0.2126, 0.7152, 0.0722));
+    let mut sum = 0.0;
+    let mut cdf = faces.map(|n| {
+        sum += luminance(sky + 0.8 * lookup(&levels[2], n));
+        sum
+    });
+    if sum <= 1e-20 {
+        let z = 1.0 - 2.0 * r.y;
+        let radius = (1.0 - z * z).max(0.0).sqrt();
+        let phi = std::f32::consts::TAU * r.x;
+        return Vec4::new(
+            radius * phi.cos(),
+            radius * phi.sin(),
+            z,
+            1.0 / (4.0 * std::f32::consts::PI),
+        );
+    }
+    for value in &mut cdf {
+        *value /= sum;
+    }
+    let face = cdf.iter().position(|v| r.y <= *v).unwrap_or(5);
+    let previous = if face == 0 { 0.0 } else { cdf[face - 1] };
+    let face_pdf = cdf[face] - previous;
+    r.y = (r.y - previous) / face_pdf;
+    let normal = faces[face];
+    let up = if normal.y.abs() > 0.999 {
+        Vec3::Z * normal.y
+    } else {
+        Vec3::Y
+    };
+    let box_position =
+        |uv: Vec2| normal - up.cross(normal) * (uv.x * 2.0 - 1.0) + up * (1.0 - uv.y * 2.0);
+    let mut offset = UVec2::ZERO;
+    let mut pdf = 1.0;
+    for (level, width) in [(1, 2), (0, 4)] {
+        offset *= 2;
+        let masses: [f32; 4] = std::array::from_fn(|i| {
+            let uv =
+                (offset.as_vec2() + Vec2::new((i & 1) as f32, (i >> 1) as f32) + Vec2::splat(0.5))
+                    / width as f32;
+            luminance(sky + 0.8 * lookup(&levels[level], box_position(uv))).max(1e-7)
+        });
+        let rows = [masses[0] + masses[1], masses[2] + masses[3]];
+        let py = rows[0] / (rows[0] + rows[1]);
+        let y = usize::from(r.y > py);
+        let px = masses[2 * y] / rows[y];
+        let x = usize::from(r.x > px);
+        let probability_y = if y == 0 { py } else { (1.0 - py).max(1e-7) };
+        let probability_x = if x == 0 { px } else { (1.0 - px).max(1e-7) };
+        r.y = (r.y - if y == 0 { 0.0 } else { py }) / probability_y;
+        pdf *= probability_y;
+        r.x = (r.x - if x == 0 { 0.0 } else { px }) / probability_x;
+        pdf *= probability_x;
+        offset += UVec2::new(x as u32, y as u32);
+    }
+    let direction = box_position((offset.as_vec2() + r) / 4.0).normalize();
+    pdf *= 16.0;
+    pdf /= 4.0;
+    pdf /= normal.dot(direction).powf(3.0);
+    pdf *= face_pdf;
+    direction.extend(pdf)
+}
+
 #[test]
 #[ignore = "requires Vulkan and slangc"]
 fn cubemap_orientation_importance_pdf_and_energy() {
@@ -146,7 +258,7 @@ fn cubemap_orientation_importance_pdf_and_energy() {
         })
     };
     const SAMPLES: usize = 262144;
-    let size = ((14 + SAMPLES) * 16) as u64;
+    let size = ((14 + SAMPLES + 32) * 16) as u64;
     let buffer = |size, usage| {
         device.create_buffer(&BufferDescriptor {
             label: None,
@@ -474,9 +586,37 @@ fn cubemap_orientation_importance_pdf_and_energy() {
                             "orientation {case}/{mode}/{i}: {} vs {expected}",
                             values[i]
                         );
+                        if merge.is_some() {
+                            let pdf = source_pdf(
+                                &pixels,
+                                rotation.conjugate() * direction.normalize(),
+                                sky,
+                                0.8,
+                            );
+                            assert!(
+                                (values[i].w - pdf).abs() < 2e-5 * pdf.max(1.0),
+                                "source leaf PDF {case}/{mode}/{i}: {} vs {pdf}",
+                                values[i].w
+                            );
+                        }
                     }
                     let mut sum = bevy::math::DVec3::ZERO;
-                    for value in &values[14..] {
+                    if merge.is_some() {
+                        for (i, actual) in values[14 + SAMPLES..].iter().enumerate() {
+                            let samples = Vec2::new((i % 8) as f32 / 8.0, (i / 8 + 1) as f32 / 6.0);
+                            let expected = source_sample(&pixels, sky, samples);
+                            let expected = if case == 2 {
+                                expected
+                            } else {
+                                (rotation * expected.truncate()).extend(expected.w)
+                            };
+                            assert!(
+                                actual.abs_diff_eq(expected, 2e-5),
+                                "source sample {case}/{i}: {actual} vs {expected}"
+                            );
+                        }
+                    }
+                    for value in &values[14..14 + SAMPLES] {
                         assert!(value.is_finite(), "nonfinite sample {value}");
                         if let Some(merge) = merge {
                             assert_eq!(

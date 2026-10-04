@@ -36,7 +36,7 @@ void read_probe_merge_test(uint bin : SV_GroupIndex) {
 [shader("compute")][numthreads(64,1,1)]
 void read_probe_sampling_test(uint lane : SV_GroupIndex) {
     let view=normalize(float3(p.sky.x,0.0,1.0));
-    let s=Surface(float3(0.0),float3(0.0,0.0,1.0),float3(0.5),p.sky.y,p.sky.z,0.5,1.0,true);
+    let s=Surface(float3(0.0),float3(0.0,0.0,1.0),float3(0.5),p.sky.y,p.sky.z,0.5,1.0,true,float3(0,0,1));
     var rng=hash32(lane+73u);var energy=0.0;var rejected=0u;
     for(var i=0u;i<2048u;i++) {
         let sampled=probe_sample_direction(0u,i%PROBE_DIRECTIONS,s,rng);
@@ -181,4 +181,28 @@ void read_hash_test() {
     checks[59]=find_closest_probe(uint2(0u,16u),int2(0));
     checks[60]=find_closest_probe(uint2(24u,16u),int2(0));
     checks[61]=find_closest_probe(uint2(16u,0u),int2(1,0));
+}
+[shader("compute")][numthreads(1,1,1)]
+void read_hash_hole_test() {
+    let desc=hash_tile_descriptor(float3(0.01),float3(1,0,0),1.0);
+    let first=desc.bucket*p.hash_config.y;
+    hash_tiles[hash_tile_meta(first)].store(0u);
+    hash_tiles[hash_tile_meta(first+1u)].store(desc.tag);
+    checks[0]=hash_tile_find(float3(0.01),float3(1,0,0),1.0);
+    checks[1]=hash_cell_index(first+1u,desc.offset,0u);
+}
+[shader("compute")][numthreads(64,1,1)]
+void concurrent_hash_claim_test(uint lane:SV_GroupIndex) {
+    let desc=hash_tile_descriptor(float3(0.01),float3(1,0,0),1.0);
+    let first=desc.bucket*p.hash_config.y;
+    if(lane==0u) {
+        work[3].store(0u);
+        for(var tile=first;tile<first+p.hash_config.y;tile++) {
+            for(var i=0u;i<4u;i++) {hash_tiles[hash_tile_meta(tile)+i].store(0u);}
+        }
+    }
+    GroupMemoryBarrierWithGroupSync();
+    checks[4u+lane]=hash_tile_insert(float3(0.01),float3(1,0,0),1.0);
+    GroupMemoryBarrierWithGroupSync();
+    if(lane==0u) {checks[0]=work[3].load();checks[1]=hash_cell_index(first,desc.offset,0u);}
 }

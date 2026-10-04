@@ -291,6 +291,20 @@ fn amd_hashing_half_packing_tile_mips_temporal_update_and_decay() {
             .map(|v| f32::from_bits(*v))
             .collect::<Vec<_>>()
     };
+    let zero = run(0, 1, true);
+    assert_eq!(
+        zero[29], 1,
+        "new tiles at frame zero are updated exactly once"
+    );
+    assert_eq!(floats(&zero, 16), [10.0, 20.0, 30.0, 4.0]);
+    let last_frame = run(u32::MAX, 1, true);
+    assert_eq!(last_frame[29], 1);
+    let wrapped = run(0, 0, true);
+    assert_eq!(
+        wrapped[29], 1,
+        "wrapped frame zero still updates live tiles once"
+    );
+    assert_eq!(floats(&wrapped, 24), [2.0, 4.0, 6.0, 2.0]);
     let first = run(1, 1, true);
     for (i, expected) in [1.0, 0.43046721, 0.00390625, 0.0, 0.0, 0.0]
         .into_iter()
@@ -784,4 +798,36 @@ fn amd_hashing_half_packing_tile_mips_temporal_update_and_decay() {
             }
         }
     }
+    let pipeline = make_pipeline("read_hash_hole_test");
+    for source in [0u32, 1] {
+        words[139] = source;
+        let bytes: Vec<_> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+        queue.write_buffer(&uniform, 0, &bytes);
+        let mut encoder = device.create_command_encoder(&CommandEncoderDescriptor::default());
+        {
+            let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor::default());
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(0, &group, &[]);
+            pass.dispatch_workgroups(1, 1, 1);
+        }
+        let values = readback(encoder);
+        assert_eq!(values[0], if source == 1 { u32::MAX } else { values[1] });
+    }
+    words[52] = 0;
+    let bytes: Vec<_> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+    queue.write_buffer(&uniform, 0, &bytes);
+    let pipeline = make_pipeline("concurrent_hash_claim_test");
+    let mut encoder = device.create_command_encoder(&CommandEncoderDescriptor::default());
+    {
+        let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor::default());
+        pass.set_pipeline(&pipeline);
+        pass.set_bind_group(0, &group, &[]);
+        pass.dispatch_workgroups(1, 1, 1);
+    }
+    let values = readback(encoder);
+    assert_eq!(
+        values[0], 1,
+        "64 concurrent first touches enqueue one tile at frame zero"
+    );
+    assert!(values[4..68].iter().all(|cell| *cell == values[1]));
 }

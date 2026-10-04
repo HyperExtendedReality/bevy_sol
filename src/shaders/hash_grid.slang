@@ -81,8 +81,9 @@ uint hash_tile_insert(float3 position, float3 direction, float distance) {
             else { existing = claim; }
         }
         if (existing != desc.tag) { continue; }
-        let previous_frame = hash_tiles[metadata + 1u].exchange(p.frame.x);
-        if (previous_frame != p.frame.x) {
+        hash_tiles[metadata + 1u].store(p.frame.x);
+        // A frame-local claim also handles new tiles at frame zero/wraparound.
+        if (hash_tiles[metadata + 3u].exchange(1u) == 0u) {
             let lane = work[3].add(1u); hash_tiles[16u + lane].store(tile);
         }
         return hash_cell_index(tile, desc.offset, 0u);
@@ -93,8 +94,10 @@ uint hash_tile_find(float3 position, float3 direction, float distance) {
     let desc = hash_tile_descriptor(position, direction, distance);
     for (var offset = 0u; offset < p.hash_config.y; offset++) {
         let tile = desc.bucket * p.hash_config.y + offset;
-        if (hash_tiles[hash_tile_meta(tile)].load() == desc.tag) { return hash_cell_index(tile, desc.offset, 0u); }
-        // Search past evicted holes; the original early exit can miss live tiles.
+        let tag=hash_tiles[hash_tile_meta(tile)].load();
+        if(tag==desc.tag) { return hash_cell_index(tile, desc.offset, 0u); }
+        if(source_probe_projection() && tag==0u) {return MISSING;}
+        // Compensated mode searches past holes left by eviction.
     }
     return MISSING;
 }
@@ -117,6 +120,11 @@ float4 hash_radiance(uint cell) {
 void hash_touch(uint cell) {
     hash_tiles[hash_tile_meta(cell / hash_mip_count()) + 1u].store(p.frame.x);
 }
+float3 directional_cached_radiance(float3 position,float3 direction,float distance,out bool found) {
+    let cell=hash_tile_find(position,direction,distance);found=cell!=MISSING;
+    if(!found) {return float3(0.0);}
+    hash_touch(cell);return hash_radiance(cell).rgb;
+}
 void hash_accumulate(uint cell, float3 value, bool indirect) {
     let tile = cell / hash_mip_count(); let linear = cell % hash_mip_count();
     let base = hash_scratch_base(tile, uint2(linear % p.hash_config.z, linear / p.hash_config.z), indirect);
@@ -128,6 +136,7 @@ void hash_accumulate(uint cell, float3 value, bool indirect) {
 void clear_hash_tiles(uint3 gid : SV_DispatchThreadID) {
     let tile = gid.x + gid.y * 65536u; if (tile >= p.hash_config.w) { return; }
     let metadata = hash_tile_meta(tile);
+    hash_tiles[metadata+3u].store(0u);
     if (p.frame.y != 0u || p.frame.x - hash_tiles[metadata + 1u].load() >= p.options.x) {
         hash_tiles[metadata].store(0u); hash_tiles[metadata + 1u].store(0u);
         hash_tiles[metadata + 2u].store(0u);
@@ -196,8 +205,17 @@ void populate_hash_cells(uint3 gid : SV_DispatchThreadID) {
     if (lane >= work[27].load() * count) { return; }
     let index = compact_fresh_probe(lane / count) * count + lane % count; let ray = rays[index];
     if (ray.info.w == MISSING || ray.info.y == MISSING || all(ray.normal.xyz == float3(0.0))) { return; }
-    var direct = directional_direct_radiance(ray.position.xyz, ray.normal.xyz, -ray.direction.xyz, ray.info.y, hash32(index ^ p.frame.x), index);
+    var has_reservoir=false;
+    if(ray.info.x==EMISSIVE_PROBE_RAY) {return;}
     let feedback = feedback_radiance(ray.position.xyz, ray.normal.xyz, ray.info.y);
+    if(source_probe_projection()&&feedback.w>0.0) {
+        rays[index].value=float4(feedback.rgb,ray.value.w);
+        rays[index].normal.w=1.0;
+        hash_accumulate(ray.info.w,feedback.rgb,false);
+        return;
+    }
+    var sample=index;if(source_probe_projection()) {sample=source_lighting_id(index,false);}
+    var direct = directional_direct_radiance(ray.position.xyz, ray.normal.xyz, -ray.direction.xyz, ray.info.y, hash32(index ^ p.frame.x), sample, has_reservoir);
     if (feedback.w > 0.0) { direct = feedback.rgb; }
     rays[index].value = float4(direct, ray.value.w);
     hash_accumulate(ray.info.w, direct, false);
@@ -219,7 +237,9 @@ float3 multibounce_radiance(float3 incoming, float4 brdf, float discard_probabil
     if (brdf.w <= 0.0 || discard_probability >= 1.0) { return float3(0.0); }
     return incoming * brdf.rgb / (brdf.w * (1.0 - discard_probability));
 }
-float3 directional_direct_radiance(float3 position, float3 n, float3 view, uint triangle, uint seed, uint reservoir_slot) {
+float3 directional_direct_radiance(float3 position, float3 n, float3 view, uint triangle, uint seed, uint reservoir_slot, out bool has_reservoir) {
+    has_reservoir=false;
+    if(source_probe_projection() && p.quality.y!=0.0 && reservoir_slot==MISSING) {return float3(0.0);}
     let bary = barycentrics(position, triangle); let indices = geometry[triangle + 11u]; let properties = geometry[triangle + 12u];
     let base = geometry[triangle + 13u].rgb * material_texture(uint(indices.x), triangle_uv(triangle, bary, 0u)).rgb;
     // GenerateReservoirs/GenerateMultibounceReservoirs in GI-1.2 force a
@@ -235,7 +255,9 @@ float3 directional_direct_radiance(float3 position, float3 n, float3 view, uint 
             info=uint4(stored.light,0u,uint(stored.count),p.frame.x);
             reservoir=float4(stored.uv,stored.weight,0.0);
         } else {
-            var rng = hash32(seed + 127u); let fresh = grid_fresh_reservoir(position,n,view,triangle,rng);
+            var rng = hash32(seed + 127u);
+            if(source_probe_projection()) {rng=source_random(reservoir_slot,p.frame.x);}
+            let fresh = grid_fresh_reservoir(position,n,view,triangle,rng);
             info = uint4(fresh.light,0u,fresh.count,p.frame.x);
             if (fresh.target_density > 0.0 && fresh.count > 0u) {
                 reservoir = float4(fresh.uv,fresh.weight_sum/(float(fresh.count)*fresh.target_density),fresh.target_density);
@@ -245,6 +267,7 @@ float3 directional_direct_radiance(float3 position, float3 n, float3 view, uint 
             // The RIS normalization is from the source location; evaluate the
             // selected light and its visibility at this actual visibility hit.
             used_reservoir = true;
+            has_reservoir=true;
             let selected = evaluate_light_cone(position,n,info.x,reservoir.xy,4.0*PI/(8.0*12000.0));
             let shadow_origin = offset_origin(position, triangle, selected.direction);
             let hit = trace_impl(shadow_origin, selected.direction, max(p.cache_config.z, selected.distance - p.cache_config.z * 2.0), true);
@@ -263,7 +286,7 @@ float3 directional_direct_radiance(float3 position, float3 n, float3 view, uint 
     var value = base * light.diffuse + light.specular;
     if(!grid_environment_enabled()) {value+=bounce_albedo(position, triangle) * sky_irradiance(n, origin, seed);}
     if (has_environment() && !grid_environment_enabled()) {
-        let surface_value = Surface(position, n, base, roughness, metallic, properties.y, 1.0, true);
+        let surface_value = Surface(position, n, base, roughness, metallic, properties.y, 1.0, true,n);
         let sample_value = sample_specular_view(surface_value, seed + 47u, view);
         if (any(sample_value.weight > float3(0.0))) {
             let hit = trace_impl(origin, sample_value.direction, p.cache_config.w, true);
@@ -276,12 +299,15 @@ float3 directional_direct_radiance(float3 position, float3 n, float3 view, uint 
 void trace_hash_bounces(uint3 gid : SV_DispatchThreadID) {
     let lane = gid.x + gid.y * 65536u; let count = p.screen.w * p.screen.w;
     if (lane >= work[27].load() * count) { return; }
-    let index = compact_fresh_probe(lane / count) * count + lane % count;
+    let source = source_probe_projection();
+    if(source && lane>=work[7].load()) {return;}
+    var index=compact_fresh_probe(lane / count) * count + lane % count;
+    if(source) {index=work[source_visibility_list(false)+lane].load();}
     rays[index].bounce_info = uint4(MISSING);
     let ray = rays[index];
     if (p.options.y == 0u || ray.info.w == MISSING || ray.info.y == MISSING || all(ray.normal.xyz == float3(0.0))) { return; }
     var rng = hash32(index ^ hash32(p.frame.x + 179u));
-    let source = source_probe_projection();
+    if(source) {rng=source_random(lane,p.frame.x);}
     var discard_sample: float;
     if (source) { discard_sample = grid_random(rng); } else { discard_sample = random(rng); }
     if (discard_sample <= p.hash_sampling.z) { return; }
@@ -300,8 +326,13 @@ void trace_hash_bounces(uint3 gid : SV_DispatchThreadID) {
     request_light_location(position);
     let cell = hash_tile_insert(position, direction, hit.distance);
     rays[index].bounce_position = float4(position, hit.distance);
-    rays[index].bounce_normal = float4(n, 0.0); rays[index].bounce_direction = float4(direction, 0.0);
+    rays[index].bounce_normal = float4(n, float(distance(ray.position.xyz,position)<hash_cell_size(position)));
+    rays[index].bounce_direction = float4(direction, 0.0);
     rays[index].bounce_info = uint4(cell, hit.triangle, 1u, cache_insert(position, n, hit.distance, hit.triangle, false));
+    if(source && cell!=MISSING) {
+        let query=source_append_visibility(index,true);
+        rays[index].bounce_direction.w=asfloat(query);
+    }
     if (source) {
         let triangle = ray.info.y; let bary = barycentrics(ray.position.xyz, triangle);
         let base = geometry[triangle + 13u].rgb * material_texture(uint(geometry[triangle + 11u].x), triangle_uv(triangle, bary, 0u)).rgb;
@@ -316,21 +347,26 @@ void populate_hash_bounces(uint3 gid : SV_DispatchThreadID) {
     if (lane >= work[27].load() * count) { return; }
     let index=compact_fresh_probe(lane / count) * count + lane % count;let ray = rays[index];
     if (ray.bounce_info.x == MISSING) { return; }
+    var has_reservoir=false;
+    var sample=index+restir_ray_capacity();if(source_probe_projection()) {sample=source_lighting_id(index,true);}
     let value = directional_direct_radiance(ray.bounce_position.xyz, ray.bounce_normal.xyz, -ray.bounce_direction.xyz,
-        ray.bounce_info.y, hash32(lane ^ hash32(p.frame.x + 181u)), index+restir_ray_capacity());
+        ray.bounce_info.y, hash32(lane ^ hash32(p.frame.x + 181u)), sample, has_reservoir);
+    if(source_probe_projection() && !has_reservoir) {rays[index].bounce_normal.w=0.0;}
     hash_accumulate(ray.bounce_info.x, value, false);
 }
 [shader("compute")][numthreads(64,1,1)]
 void resolve_hash_bounces(uint3 gid : SV_DispatchThreadID) {
     let lane = gid.x + gid.y * 65536u; let count = p.screen.w * p.screen.w;
     if (lane >= work[27].load() * count) { return; }
-    let ray = rays[compact_fresh_probe(lane / count) * count + lane % count];
+    let index=compact_fresh_probe(lane / count) * count + lane % count;let ray = rays[index];
     if (ray.bounce_info.x == MISSING) { return; }
     let direct = hash_filtered(ray.bounce_info.x, false);
     let incoming = direct.rgb / max(direct.w, 1.0);
-    let value = select(source_probe_projection(),
-        multibounce_radiance(incoming, float4(unpack2x16float(ray.bounce_info.z), unpack2x16float(ray.bounce_info.w)), p.hash_sampling.z),
-        bounce_albedo(ray.position.xyz, ray.info.y) * incoming);
+    var value: float3;
+    if(source_probe_projection()) {
+        value=multibounce_radiance(incoming, float4(unpack2x16float(ray.bounce_info.z), unpack2x16float(ray.bounce_info.w)), p.hash_sampling.z);
+        if(ray.bounce_normal.w!=0.0) {rays[index].probe_bounce=float4(value,1.0);}
+    } else {value=bounce_albedo(ray.position.xyz, ray.info.y) * incoming;}
     hash_accumulate(ray.info.w, value, true);
 }
 

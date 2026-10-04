@@ -1,5 +1,5 @@
 // AMD Capsaicin lights/box_sampling.hlsl and light_sampling.hlsl, pinned in
-// THIRD_PARTY_NOTICES.md. Hardened black-map handling and matching PDF descent.
+// THIRD_PARTY_NOTICES.md. Hardened black-map handling; source leaf PDF or matching descent.
 bool has_environment() { return any(p.sky.rgb > 0.0) || p.environment.x > 0.0; }
 #ifndef GI_GRID_ENVIRONMENT
 #define GI_GRID_ENVIRONMENT 0
@@ -88,34 +88,54 @@ float4 sample_environment_importance(float2 samples) {
         let z=1.0-2.0*samples.y;let radius=sqrt(max(1.0-z*z,0.0));
         return float4(radius*cos(2.0*PI*samples.x),radius*sin(2.0*PI*samples.x),z,1.0/(4.0*PI));
     }
-    let target=min(samples.y,0.99999994)*sum;var face=0u;
-    while(face<5u && target>=cdf[face]) {face++;}
+    let source=source_probe_projection();
+    if(source) {for(var i=0u;i<6u;i++) {cdf[i]/=sum;}}
+    let target=select(source,samples.y,min(samples.y,0.99999994)*sum);var face=0u;
+    while(face<5u && select(source,target>cdf[face],target>=cdf[face])) {face++;}
+    // The pinned sampler is undefined for an exact zero-mass CDF endpoint.
+    while(face<5u && cdf[face]==select(face>0u,cdf[max(face,1u)-1u],0.0)) {face++;}
     let previous=select(face>0u,cdf[max(face,1u)-1u],0.0);
     let mass=cdf[face]-previous;
-    var r=float2(samples.x,clamp((target-previous)/mass,0.0,0.99999994));
-    var pdf=mass/sum;var offset=int2(0);var width=1.0;
+    var r=float2(samples.x,(target-previous)/mass);
+    if(!source) {r.y=clamp(r.y,0.0,0.99999994);}
+    var pdf=select(source,1.0,mass/sum);var offset=int2(0);var width=1.0;
     for(int level=int(p.environment.w)-2;level>=0;level--) {
         offset*=2;width*=2.0;
         let m=environment_child_mass(face,offset,width,float(level));
         let rows=float2(m.x+m.y,m.z+m.w);let py=rows.x/(rows.x+rows.y);
         let y=select(r.y>py,1u,0u);let px=m[y*2u]/rows[y];let x=select(r.x>px,1u,0u);
-        let probability_y=select(y==0u,py,1.0-py);let probability_x=select(x==0u,px,1.0-px);
-        r=float2((r.x-select(x==0u,0.0,px))/max(probability_x,1e-20),
+        var probability_y=select(y==0u,py,1.0-py);var probability_x=select(x==0u,px,1.0-px);
+        if(source) {
+            if(y!=0u) {probability_y=max(probability_y,1e-7);}
+            if(x!=0u) {probability_x=max(probability_x,1e-7);}
+            r.y=(r.y-select(y==0u,0.0,py))/probability_y;pdf*=probability_y;
+            r.x=(r.x-select(x==0u,0.0,px))/probability_x;pdf*=probability_x;
+        } else {
+            r=float2((r.x-select(x==0u,0.0,px))/max(probability_x,1e-20),
                  (r.y-select(y==0u,0.0,py))/max(probability_y,1e-20));
-        r=clamp(r,0.0,0.99999994);
-        pdf*=probability_x*probability_y;offset+=int2(x,y);
+            r=clamp(r,0.0,0.99999994);pdf*=probability_x*probability_y;
+        }
+        offset+=int2(x,y);
     }
     let local=normalize(environment_box_position((float2(offset)+r)/width,face));
     let cosine=dot(ENVIRONMENT_FACES[face],local);
-    pdf*=width*width/(4.0*cosine*cosine*cosine);
+    if(source) {pdf*=width*width;pdf/=4.0;pdf/=pow(cosine,3.0);pdf*=mass;}
+    else {pdf*=width*width/(4.0*cosine*cosine*cosine);}
     let inverse=float4(-p.environment_rotation.xyz,p.environment_rotation.w);
     return float4(environment_rotate(inverse,local),pdf);
 }
 float environment_importance_pdf(float3 direction) {
     let local=environment_rotate(p.environment_rotation,direction);uint face;
-    let uv=clamp(environment_box_uv(local,face),0.0,0.99999994);
+    let box_uv=environment_box_uv(local,face);
     var sum=0.0;for(uint i=0u;i<6u;i++) {sum+=environment_face_mass(i);}
     if(sum<=1e-20) {return 1.0/(4.0*PI);}
+    if(source_probe_projection()) {
+        let snapped=(ceil(box_uv*p.environment.z)-0.5)/p.environment.z;
+        let intensity=luminance(environment_local_radiance(environment_box_position(snapped,face),0.0));
+        let cosine=dot(ENVIRONMENT_FACES[face],local);
+        return (intensity/sum)/(4.0*cosine*cosine*cosine);
+    }
+    let uv=clamp(box_uv,0.0,0.99999994);
     var pdf=environment_face_mass(face)/sum;var offset=int2(0);var width=1.0;
     // Descend the same conditional probabilities as the sampler. Using only
     // leaf luminance/sum disagrees with the clamped children of dark mip nodes.

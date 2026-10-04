@@ -39,6 +39,9 @@ float4 probe_shadow_preserving_blend(float4 current,float4 previous) {
     return lerp(current,previous,response*response);
 }
 bool source_probe_projection() {return (p.restir.w&1u)!=0u;}
+bool source_direct_lighting_enabled(uint flags) {return (flags&1u)==0u || (flags&2u)==0u;}
+bool source_direct_lighting_enabled() {return source_direct_lighting_enabled(p.restir.w);}
+float3 source_direct_radiance(float3 radiance) {return select(source_direct_lighting_enabled(),radiance,float3(0.0));}
 groupshared float3 probe_atlas_radiance[64];
 groupshared float3 probe_atlas_direction[64];
 [shader("compute")][numthreads(64,1,1)]
@@ -170,14 +173,20 @@ void prepare_probe_sampling(uint3 gid : SV_DispatchThreadID,uint local : SV_Grou
                     probe_reuse_reconnect(base,bin,position,normal,resident.position.xyz,resident.normal.xyz,resident.samples[bin]);
                 }
             }
-            var candidate=work[probe_cache_heads()+uint(tap.x)+uint(tap.y)*p.screen.x].load();
-            for(var visited=0u;candidate!=MISSING&&visited<probe_cache_count();visited++) {
+            let tile_index=uint(tap.x)+uint(tap.y)*p.screen.x;
+            let head=work[probe_cache_heads()+tile_index].load();
+            let count=select(source_probe_projection(),head,probe_cache_count());
+            var start=0u;
+            if(source_probe_projection()) {start=work[source_candidate_offsets()+tile_index].load()+work[source_candidate_blocks()+tile_index/128u].load();}
+            var candidate=head;
+            for(var visited=0u;visited<count&&(source_probe_projection()||candidate!=MISSING);visited++) {
+                if(source_probe_projection()) {candidate=work[source_candidate_list()+start+visited].load();}
                 let cached_position=probe_cache[candidate].probe.position.xyz;
                 if((source_probe_projection() || old!=p.scene_info.z+candidate) && abs(dot(cached_position-position,normal))<cell_size) {
                     probe_reuse_reconnect(base,bin,position,normal,cached_position,
-                        probe_cache[candidate].probe.normal.xyz,probe_cache[candidate].probe.samples[bin]);
+                        cached_probe_normal(probe_cache[candidate].probe),probe_cache[candidate].probe.samples[bin]);
                 }
-                candidate=probe_cache[candidate].next;
+                if(!source_probe_projection()) {candidate=probe_cache[candidate].next;}
             }
         }}
     }
@@ -220,16 +229,16 @@ uint probe_sample_cdf(uint index,float sample) {
     return lower;
 }
 float4 probe_sample_direction(uint index,uint bin,Surface s,inout uint rng) {
-    let frame=probe_frame(s.normal);
+    let frame_normal=surface_plane_normal(s);let frame=probe_frame(frame_normal);
     let view=select(p.camera.w!=0.0,p.camera_direction.xyz,normalize(p.camera.xyz-s.position));
     let local_view=mul(transpose(frame),view);
-    let dominant=ggx_specular_direction(s.normal,view,s.roughness);
+    let dominant=ggx_specular_direction(surface_shading_normal(s),view,s.roughness);
     let half_vector=normalize(view+dominant);
     let f0=lerp(float3(0.16*s.reflectance*s.reflectance),s.base,s.metallic);
     let probability=select(local_view.z>0.0,
         brdf_specular_probability(f0,dot(half_vector,view),s.base*(1.0-s.metallic)),0.0);
     if(source_probe_projection()) {
-        let rotation=ggx_rotation_to_z(s.normal);let source_view=ggx_rotate(rotation,view);
+        let rotation=ggx_rotation_to_z(frame_normal);let source_view=ggx_rotate(rotation,view);
         let samples=float2(grid_random(rng),grid_random(rng));
         var direction=float3(0.0);
         if(grid_random(rng)<probability) {
@@ -242,7 +251,7 @@ float4 probe_sample_direction(uint index,uint bin,Surface s,inout uint rng) {
             if(probe_unpack(probes[index].samples[bin]).w>0.0 && asfloat(probes[index].filtered_samples[0].y)>0.0) {bin=sampled_bin;}
             direction=normalize(mul(frame,probe_hemi_octahedron(bin_uv(bin,float2(grid_random(rng),grid_random(rng))))));
         }
-        return float4(direction,select(dot(direction,s.normal)>0.0,1.0,0.0));
+        return float4(direction,select(dot(direction,frame_normal)>0.0,1.0,0.0));
     }
     // The source's Fresnel layer selection is mixed with uniform coverage.
     // The full directional PDF compensates both material and radiance guiding.

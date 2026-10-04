@@ -39,18 +39,22 @@ fn texture_features() -> WgpuFeatures {
 }
 
 const CACHE_BYTES: u64 = 224;
-const RAY_BYTES: u64 = 144;
+const RAY_BYTES: u64 = 160;
 const WORK_HEADER: u64 = 32;
-const BASE_STAGES: usize = 95;
-const STAGES: [&str; 99] = [
+const BASE_STAGES: usize = 99;
+const STAGES: [&str; 103] = [
     "compute_brdf_lut",
     "reset_work",
+    "prepare_primary_geometry_normals",
     "clear_light_grid_bounds",
     "clear_cache",
     "clear_hash_tiles",
     "clear_restir",
     "prepare_probe_cache",
     "project_probe_cache",
+    "scan_source_candidates",
+    "scan_source_candidate_blocks",
+    "scatter_source_candidates",
     "reproject_screen_probes",
     "reproject_probe_history",
     "snapshot_reprojected_probes",
@@ -212,6 +216,8 @@ fn compile_shader(
                     format!("GI_HARDWARE={}", u32::from(hardware)),
                     format!("GI_TEXTURED={}", u32::from(textured)),
                     "GI_GRID_ENVIRONMENT=1".into(),
+                    "GI_SOURCE_RANDOM_BUFFER=2".into(),
+                    "GI_PRIMARY_GEOMETRY_NORMALS=1".into(),
                 ],
                 ..default()
             },
@@ -514,6 +520,12 @@ struct ViewGi {
     prepared: bool,
 }
 
+#[derive(Resource, Default)]
+struct GpuRandom {
+    table: crate::random::SeedTable,
+    buffer: Option<Buffer>,
+}
+
 pub(crate) fn install(app: &mut App) {
     let settings = app.world().resource::<GiSettings>().clone();
     let Some(render) = app.get_sub_app(RenderApp) else {
@@ -541,7 +553,7 @@ pub(crate) fn install(app: &mut App) {
         );
         return;
     }
-    if limits.max_storage_buffers_per_shader_stage < 12
+    if limits.max_storage_buffers_per_shader_stage < 13
         || limits.max_storage_textures_per_shader_stage < 4
         || limits.max_sampled_textures_per_shader_stage < 12
     {
@@ -557,7 +569,7 @@ pub(crate) fn install(app: &mut App) {
     let mut compute = compile_shader(compiler, "gi.slang", directions, hardware, textured);
     let bindings: Vec<_> = (0..=20)
         .chain(hardware.then_some(21))
-        .chain([24, 25, 27, 28, 29, 30, 31, 32, 33])
+        .chain([24, 25, 27, 28, 29, 30, 31, 32, 33, 34])
         .collect();
     let mappings: Vec<_> = bindings
         .iter()
@@ -590,6 +602,7 @@ pub(crate) fn install(app: &mut App) {
     render
         .init_resource::<GpuScene>()
         .init_resource::<GpuEnvironment>()
+        .init_resource::<GpuRandom>()
         .add_systems(RenderStartup, init_pipelines)
         .add_systems(
             Render,
@@ -669,7 +682,7 @@ fn init_pipelines(
             visibility: ShaderStages::COMPUTE,
             ty: BindingType::StorageTexture {
                 access: StorageTextureAccess::WriteOnly,
-                format: if binding == 17 {
+                format: if binding == 17 || binding == 18 {
                     TextureFormat::Rgba32Float
                 } else {
                     TextureFormat::Rgba16Float
@@ -718,6 +731,7 @@ fn init_pipelines(
     ));
     entries.push(buffer_layout(25, false, 64));
     entries.push(buffer_layout(33, false, 64));
+    entries.push(buffer_layout(34, true, 4));
     entries.push(buffer_layout(27, false, 16384));
     entries.push(buffer_layout(28, false, 96));
     entries.push(buffer_layout(
@@ -983,6 +997,11 @@ fn storage(device: &RenderDevice, label: &'static str, size: u64) -> Buffer {
 }
 fn allocate_view(device: &RenderDevice, size: UVec2, settings: &GiSettings) -> Option<ViewGi> {
     let c = &settings.0;
+    let auxiliary_capacity = if c.probe_projection == crate::ProbeProjection::SourceAtlas {
+        0
+    } else {
+        c.cache_capacity
+    };
     let tiles = UVec2::new(
         size.x.div_ceil(c.probe_spacing),
         size.y.div_ceil(c.probe_spacing),
@@ -996,21 +1015,30 @@ fn allocate_view(device: &RenderDevice, size: UVec2, settings: &GiSettings) -> O
     )?;
     let rays_count = probes_count.checked_mul(c.probe_directions.pow(2))?;
     let cached_probes = u64::from(tiles.x) * u64::from(tiles.y);
+    let source_words = if c.probe_projection == crate::ProbeProjection::SourceAtlas {
+        4 * u64::from(rays_count)
+            + 2 * u64::from(size.x) * u64::from(size.y)
+            + 5 * cached_probes
+            + cached_probes.div_ceil(128)
+    } else {
+        0
+    };
     let limits = device.limits();
     let sizes = [
         u64::from(probes_count) * probe_bytes(c.probe_directions),
         u64::from(rays_count) * RAY_BYTES,
-        u64::from(c.cache_capacity) * CACHE_BYTES,
+        u64::from(auxiliary_capacity.max(1)) * CACHE_BYTES,
         (WORK_HEADER
             + u64::from(probes_count)
-            + 2 * u64::from(c.cache_capacity)
+            + 2 * u64::from(auxiliary_capacity)
             + probe_mask_words(tiles)
             + 20
             + 5 * cached_probes
             + cached_probes.div_ceil(128)
             + u64::from(probes_count)
             + 4
-            + 3 * cached_probes)
+            + 5 * cached_probes
+            + source_words)
             * 4,
         c.hash_grid.bytes(),
         c.reflection.bytes(size),
@@ -1030,7 +1058,7 @@ fn allocate_view(device: &RenderDevice, size: UVec2, settings: &GiSettings) -> O
         || sizes
             .iter()
             .any(|&n| n > limits.max_storage_buffer_binding_size || n > limits.max_buffer_size)
-        || limits.max_storage_buffers_per_shader_stage < 12
+        || limits.max_storage_buffers_per_shader_stage < 13
         || limits.max_storage_textures_per_shader_stage < 4
     {
         warn_once!(
@@ -1079,8 +1107,8 @@ fn allocate_view(device: &RenderDevice, size: UVec2, settings: &GiSettings) -> O
         previous_specular: Image::new(device, size, TextureFormat::Rgba16Float),
         position: Image::new(device, size, TextureFormat::Rgba32Float),
         previous_position: Image::new(device, size, TextureFormat::Rgba32Float),
-        normal: Image::new(device, size, TextureFormat::Rgba16Float),
-        previous_normal: Image::new(device, size, TextureFormat::Rgba16Float),
+        normal: Image::new(device, size, TextureFormat::Rgba32Float),
+        previous_normal: Image::new(device, size, TextureFormat::Rgba32Float),
         previous_combined: Image::new(device, size, TextureFormat::Rgba16Float),
         previous_exposure: 1.0,
         previous_intensity: 1.0,
@@ -1109,6 +1137,7 @@ fn prepare_views(
     scene: Res<GiScene>,
     gpu: Res<GpuScene>,
     environment: Res<GpuEnvironment>,
+    mut random: ResMut<GpuRandom>,
     pipelines: Option<Res<Pipelines>>,
     cache: Res<PipelineCache>,
     device: Res<RenderDevice>,
@@ -1135,12 +1164,65 @@ fn prepare_views(
     if !gpu.ready {
         return;
     }
-    for (entity, view, camera, prepass, gi, msaa, mut state, jitter, resolution_override) in
-        &mut views
-    {
-        if let Some(state) = state.as_mut() {
+    for (_, _, _, _, _, _, state, _, _) in views.iter_mut() {
+        if let Some(mut state) = state {
             state.prepared = false;
         }
+    }
+    let count = if settings.0.probe_projection == crate::ProbeProjection::SourceAtlas {
+        views
+            .iter_mut()
+            .filter_map(|(_, view, camera, prepass, gi, msaa, _, _, resolution)| {
+                let viewport = UVec2::new(view.viewport.z, view.viewport.w);
+                let size = resolution.map_or(viewport, |r| r.0);
+                if *msaa != Msaa::Off
+                    || !camera.hdr
+                    || view.target_format != TextureFormat::Rgba16Float
+                    || !gi.intensity.is_finite()
+                    || gi.intensity < 0.0
+                    || prepass.depth_view().is_none()
+                    || prepass.deferred_view().is_none()
+                    || prepass.motion_vectors_view().is_none()
+                    || size.min_element() == 0
+                    || size.x > viewport.x
+                    || size.y > viewport.y
+                {
+                    return None;
+                }
+                crate::random::seed_count(size)
+            })
+            .max()
+            .unwrap_or(1)
+    } else {
+        1
+    };
+    if u64::from(count) * 4 > device.limits().max_storage_buffer_binding_size
+        || u64::from(count) * 4 > device.limits().max_buffer_size
+    {
+        warn_once!("bevy_sol: renderer random seed table exceeds storage-buffer limits");
+        return;
+    }
+    if random.table.update(count, &settings.0.random) {
+        let buffer = storage(
+            &device,
+            "bevy_sol renderer random seeds",
+            random.table.seeds.len() as u64 * 4,
+        );
+        let bytes: Vec<_> = random
+            .table
+            .seeds
+            .iter()
+            .flat_map(|word| word.to_le_bytes())
+            .collect();
+        queue.write_buffer(&buffer, 0, &bytes);
+        random.buffer = Some(buffer);
+    }
+    let random_buffer = random
+        .buffer
+        .as_ref()
+        .expect("initialized renderer seed table");
+    for (entity, view, camera, prepass, gi, msaa, state, jitter, resolution_override) in &mut views
+    {
         if *msaa != Msaa::Off
             || !camera.hdr
             || view.target_format != TextureFormat::Rgba16Float
@@ -1190,6 +1272,7 @@ fn prepare_views(
                 &queue,
                 &settings,
                 &environment,
+                random_buffer,
                 jitter,
             );
             commands.entity(entity).insert(new);
@@ -1208,6 +1291,7 @@ fn prepare_views(
                 &queue,
                 &settings,
                 &environment,
+                random_buffer,
                 jitter,
             );
         }
@@ -1228,10 +1312,16 @@ fn prepare_view(
     queue: &RenderQueue,
     settings: &GiSettings,
     environment: &GpuEnvironment,
+    random_buffer: &Buffer,
     jitter: Option<&TemporalJitter>,
 ) {
     let c = &settings.0;
     let main_viewport = UVec4::new(view.viewport.x, view.viewport.y, state.size.x, state.size.y);
+    let auxiliary_capacity = if c.probe_projection == crate::ProbeProjection::SourceAtlas {
+        0
+    } else {
+        c.cache_capacity
+    };
     let mut projection = view.clip_from_view;
     let Some(data) = scene.data.as_ref() else {
         return;
@@ -1251,7 +1341,9 @@ fn prepare_view(
         || state.frames == u32::MAX;
     let reset = if history_reset {
         1
-    } else if state.last_revision != scene.revision {
+    } else if c.probe_projection != crate::ProbeProjection::SourceAtlas
+        && state.last_revision != scene.revision
+    {
         2
     } else {
         0
@@ -1259,6 +1351,7 @@ fn prepare_view(
     // Lighting invalidation clears estimators, not the random sequence. Repeated
     // scene edits must not freeze jitter and light samples at frame one.
     let frame = state.frames.checked_add(1).unwrap_or(1);
+    let (reflection_radii, firefly_thresholds) = c.reflection.reconstruction_settings();
     state.params.set(Params {
         world_from_clip: clip.inverse(),
         previous_clip_from_world: state.previous_clip,
@@ -1276,7 +1369,7 @@ fn prepare_view(
             c.probe_spacing,
             c.probe_directions,
         ),
-        frame: UVec4::new(frame, reset, c.cache_capacity, c.direct_samples),
+        frame: UVec4::new(frame, reset, auxiliary_capacity, c.direct_samples),
         scene_info: UVec4::new(
             data.node_count,
             (scene.lights.len() / 5) as u32,
@@ -1350,14 +1443,14 @@ fn prepare_view(
             u32::from(c.reflection.cleanup_fireflies),
         ),
         reflection_filter: Vec4::new(
-            c.reflection.split_radius as f32,
-            c.reflection.mark_fireflies_radius as f32,
-            c.reflection.cleanup_fireflies_radius as f32,
+            reflection_radii[0] as f32,
+            reflection_radii[1] as f32,
+            reflection_radii[2] as f32,
             c.reflection.high_roughness_threshold,
         ),
         reflection_thresholds: Vec4::new(
-            c.reflection.firefly_low_threshold,
-            c.reflection.firefly_high_threshold,
+            firefly_thresholds[0],
+            firefly_thresholds[1],
             f32::from(gi.intensity == 1.0 && state.previous_intensity == 1.0),
             if view.clip_from_view.w_axis.w == 1.0 {
                 0.0
@@ -1394,7 +1487,10 @@ fn prepare_view(
             c.world_space_restir.num_cells,
             c.world_space_restir.entries_per_cell,
             state.probes_count * c.probe_directions.pow(2) * 2,
-            u32::from(c.probe_projection == crate::ProbeProjection::SourceAtlas),
+            u32::from(c.probe_projection == crate::ProbeProjection::SourceAtlas)
+                | (u32::from(!c.source_direct_lighting) << 1)
+                | (u32::from(c.source_disable_albedo_textures) << 2)
+                | (u32::from(c.source_disable_alpha_testing) << 3),
         ),
         restir_sampling: state
             .previous_camera
@@ -1413,7 +1509,7 @@ fn prepare_view(
     state.params.write_buffer(device, queue);
     let cache_matrix_offset = (WORK_HEADER
         + u64::from(state.probes_count)
-        + 2 * u64::from(c.cache_capacity)
+        + 2 * u64::from(auxiliary_capacity)
         + probe_mask_words(state.tiles)
         + 4)
         * 4;
@@ -1427,7 +1523,8 @@ fn prepare_view(
             gi.intensity * camera.exposure,
             f32::from(gi.reflections),
             f32::from(c.diffuse_denoiser == crate::DiffuseDenoiser::AdaptiveSeparable),
-            0.0,
+            (u32::from(c.probe_projection == crate::ProbeProjection::SourceAtlas)
+                | (u32::from(c.source_disable_albedo_textures) << 2)) as f32,
         ),
         camera: view
             .world_from_view
@@ -1543,6 +1640,10 @@ fn prepare_view(
         entries.push(BindGroupEntry {
             binding: 33,
             resource: state.restir.as_entire_binding(),
+        });
+        entries.push(BindGroupEntry {
+            binding: 34,
+            resource: random_buffer.as_entire_binding(),
         });
         device.create_bind_group(
             "bevy_sol compute",
@@ -1705,7 +1806,22 @@ fn dispatch(
                 )
                 > 128 * settings.0.light_grid.reservoirs_per_cell;
         let enabled = match stage {
-            "reproject_screen_probes"
+            "clear_cache"
+            | "compact_primary_cells"
+            | "trace_cache_bounces"
+            | "compact_touched_cells"
+            | "generate_reservoirs"
+            | "update_cache_direct"
+            | "update_cache_indirect"
+            | "resolve_cache_bounces"
+            | "snapshot_cache" => {
+                settings.0.probe_projection != crate::ProbeProjection::SourceAtlas
+            }
+            "prepare_primary_geometry_normals"
+            | "scan_source_candidates"
+            | "scan_source_candidate_blocks"
+            | "scatter_source_candidates"
+            | "reproject_screen_probes"
             | "reproject_probe_history"
             | "snapshot_reprojected_probes"
             | "schedule_screen_probes"
@@ -1839,12 +1955,13 @@ fn dispatch(
                 "clear_hash_tiles" => linear(settings.0.hash_grid.tiles()),
                 "prepare_probe_cache"
                 | "project_probe_cache"
+                | "scatter_source_candidates"
                 | "scatter_probe_cache_lru"
                 | "copy_probe_cache_lru" => linear(state.tiles.x * state.tiles.y),
                 "reuse_cached_probes" => linear(state.probes_count),
                 "allocate_probe_cache" => linear(state.probes_count),
-                "scan_probe_cache_blocks" => (1, 1, 1),
-                "scan_probe_cache_lru" => {
+                "scan_probe_cache_blocks" | "scan_source_candidate_blocks" => (1, 1, 1),
+                "scan_probe_cache_lru" | "scan_source_candidates" => {
                     let groups = (state.tiles.x * state.tiles.y).div_ceil(128);
                     (groups.min(65535), groups.div_ceil(65535), 1)
                 }
