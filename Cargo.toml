@@ -8,10 +8,10 @@ license = "MIT OR Apache-2.0"
 
 [dependencies]
 bevy = { version = "0.19.1", default-features = false, features = ["3d_bevy_render", "multi_threaded", "bevy_log"] }
+bevy_slang = { path = "../bevy_slang", features = ["spirv_passthrough"] }
 
 [dev-dependencies]
 bevy = { version = "0.19.1", default-features = false, features = ["3d", "bevy_log"] }
-naga = { version = "29", features = ["wgsl-in"] }
 
 [profile.dev]
 opt-level = 1

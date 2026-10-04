@@ -1,0 +1,19 @@
+[[vk::binding(21, 0)]] RaytracingAccelerationStructure scene_tlas;
+Hit trace_impl(float3 origin, float3 direction, float far, bool any_hit) {
+    RayDesc ray;
+    ray.Origin = origin; ray.Direction = direction;
+    ray.TMin = p.cache_config.z; ray.TMax = far;
+    RayQuery<RAY_FLAG_NONE> query;
+    query.TraceRayInline(scene_tlas, any_hit ? RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH : RAY_FLAG_NONE, 0xffu, ray);
+    while (query.Proceed()) {
+        if (query.CandidateType() == CANDIDATE_NON_OPAQUE_TRIANGLE) {
+            let triangle = p.scene_info.x * 2u + query.CandidatePrimitiveIndex() * TRIANGLE_WORDS;
+            if (material_visible(triangle, query.CandidateTriangleBarycentrics())) {
+                query.CommitNonOpaqueTriangleHit();
+            }
+        }
+    }
+    if (query.CommittedStatus() == COMMITTED_NOTHING) { return Hit(far, MISSING, float2(0.0)); }
+    return Hit(query.CommittedRayT(), p.scene_info.x * 2u + query.CommittedPrimitiveIndex() * TRIANGLE_WORDS,
+        query.CommittedTriangleBarycentrics());
+}

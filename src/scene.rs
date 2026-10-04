@@ -32,6 +32,9 @@ pub(crate) struct GiScene {
     pub shape_revision: u64,
     pub lighting_revision: u64,
     pub revision: u64,
+    /// Lighting/material/topology edits invalidate pixel histories. Pose-only
+    /// refits invalidate world caches while motion vectors reproject pixels.
+    pub history_revision: u64,
     instances: HashMap<Entity, (AssetId<Mesh>, AssetId<StandardMaterial>, Mat4)>,
     material_membership: Vec<(AssetId<StandardMaterial>, Option<bool>)>,
     retry: bool,
@@ -175,6 +178,7 @@ pub(crate) fn update_scene(
     if !lighting_dirty {
         return;
     }
+    let mut history_dirty = mesh_changes || material_changes || image_changes;
     if geometry_dirty {
         let mut triangles = Vec::new();
         let mut excluded = 0;
@@ -268,6 +272,7 @@ pub(crate) fn update_scene(
             stats.bvh_refits += 1;
             refitted
         } else {
+            history_dirty = true;
             stats.bvh_builds += 1;
             pack_geometry(triangles)
         };
@@ -397,6 +402,9 @@ pub(crate) fn update_scene(
     let mut packed: Vec<Vec4> = sources.into_iter().flatten().collect();
     if packed.is_empty() {
         packed.push(Vec4::ZERO);
+    }
+    if history_dirty || packed.as_slice() != scene.lights.as_slice() {
+        scene.history_revision += 1;
     }
     scene.lights = Arc::new(packed);
     scene.lighting_revision += 1;
@@ -969,6 +977,32 @@ mod tests {
         app.update();
         assert!(app.world().resource::<GiScene>().revision > revision);
         assert!(app.world().resource::<GiStatistics>().error.is_none());
+    }
+    #[test]
+    fn pose_refits_preserve_pixel_history_but_material_and_light_edits_reset_it() {
+        let (mut app, entity, material) = scene_app();
+        let history = app.world().resource::<GiScene>().history_revision;
+        let revision = app.world().resource::<GiScene>().revision;
+        *app.world_mut().get_mut::<GlobalTransform>(entity).unwrap() =
+            GlobalTransform::from_translation(Vec3::new(0.01, 0.0, 0.0));
+        app.update();
+        assert!(app.world().resource::<GiScene>().revision > revision);
+        assert_eq!(app.world().resource::<GiScene>().history_revision, history);
+        assert_eq!(app.world().resource::<GiStatistics>().bvh_refits, 1);
+        app.world_mut()
+            .resource_mut::<Assets<StandardMaterial>>()
+            .get_mut(&material)
+            .unwrap()
+            .base_color = Color::BLACK;
+        app.world_mut()
+            .write_message(AssetEvent::Modified { id: material.id() });
+        app.update();
+        let updated_history = app.world().resource::<GiScene>().history_revision;
+        assert!(updated_history > history);
+        app.world_mut()
+            .spawn((PointLight::default(), GlobalTransform::IDENTITY));
+        app.update();
+        assert!(app.world().resource::<GiScene>().history_revision > updated_history);
     }
     #[test]
     fn emitter_links_follow_light_reordering_without_rebuilding_bvh() {

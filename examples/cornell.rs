@@ -57,7 +57,7 @@ fn main() {
                 min_cell_size: 0.08,
                 cell_size_scale: 0.005,
                 direct_samples: 4,
-                probe_directions: 4,
+                probe_directions: 8,
                 ..default()
             },
         })

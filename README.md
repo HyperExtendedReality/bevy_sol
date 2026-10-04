@@ -1,8 +1,9 @@
 # bevy_sol
 
 **GI-1.2-inspired hybrid global illumination for Bevy 0.19.1.** Rust prepares the
-scene, manages GPU resources, and integrates the renderer. WGSL uses Vulkan
-hardware ray queries or a software triangle BVH, combines screen probes with a world radiance cache, and reconstructs
+scene, manages GPU resources, and integrates the renderer. The custom `bevy_slang`
+crate compiles embedded Slang modules to native SPIR-V. Shaders use Vulkan
+hardware ray queries or a software triangle BVH, combine screen probes with a world radiance cache, and reconstruct
 diffuse lighting and glossy reflections. Bevy continues to render direct lights.
 
 This is an experimental adaptation of the architecture in AMD's
@@ -42,55 +43,103 @@ installs deferred prepasses on plain 3D cameras to preserve their direct renderi
 Use `Msaa::Off` and the default RGBA16F HDR target. Explicitly forward-rendered or
 custom materials without Bevy's deferred G-buffer cannot receive this GI.
 
+Install `slangc` on `PATH`, set `SLANGC`, or configure
+`HybridGiConfig::slang_compiler` with a compiler path. Shaders compile once during
+plugin initialization, with only the selected tracing/material specialization.
+The dependency currently uses the sibling `../bevy_slang` checkout.
+
 `HybridGiConfig` configures allocation and sampling when the plugin is added.
 `HybridGi` controls intensity and reflections per camera. Increase `reset` on
 camera cuts. Perspective/orthographic projections and Bevy's temporal jitter are
-handled. Resize/viewport changes allocate fresh history; scene, material,
-and light edits reset histories automatically. Remove `HybridGi` to disable GI
+handled. Resize/viewport changes allocate fresh history; material, topology,
+and light edits reset histories automatically. Pose-only refits clear world caches
+while Bevy's motion-vector prepass reprojects compatible diffuse and primary
+reflection pixel histories, including skinned and morphed receivers. Remove `HybridGi` to disable GI
 and release that camera's resources. Add `GiExclude` to exclude a mesh from
 secondary-ray geometry and emissive sampling while letting it receive GI.
 
-The library leaves window/platform setup to the application. A compute-capable
-backend with seven storage buffers, four storage textures, and ten sampled
-textures per stage is required.
+The library leaves window/platform setup to the application. Vulkan with
+`WgpuFeatures::PASSTHROUGH_SHADERS`, twelve storage buffers, four storage textures,
+and twelve sampled textures per stage is required. Bevy's default functionality
+settings enable available adapter features; custom `WgpuSettings` must enable
+passthrough explicitly. These trusted application shaders bypass Naga's importer;
+Slang validates emitted SPIR-V. Sparse bindings are relocated by `bevy_slang` to
+wgpu's Vulkan layout indices.
 Vulkan hardware and software traversal are tested here. `GiRayBackend::Auto`
 selects hardware when the device has enabled `EXPERIMENTAL_RAY_QUERY`, otherwise
 software. `Hardware` requires that feature in the application's `WgpuSettings`;
 `Software` forces BVH traversal. Wgpu 29's ray queries currently require Vulkan.
-Software traversal on DX12, Metal, and WebGPU remains unverified.
-WebGL2 is unsupported. GPU limits are checked before scene/view allocation.
+This native SPIR-V pipeline currently targets Vulkan for both traversal modes.
+DX12, Metal, WebGPU and WebGL2 are unsupported. GPU limits are checked before
+scene/view allocation.
 Secondary material textures additionally require texture binding arrays and
 nonuniform indexing. A scene exceeding the 64-image capacity, or a device lacking
 these features for a textured scene, disables GI with a diagnostic.
+
+Insert `GiEnvironmentMap` to light the scene with a raw HDR cubemap. Its image
+must have six square layers and a `Cube` texture view, as used by `Skybox`.
+`intensity` scales scene-linear radiance and `rotation` turns the map into world
+space. Constant `sky_radiance` is added to it. Map loading, replacement, in-place
+reloads, rotation and intensity changes reset lighting histories automatically.
+The sampling choices are `UniformHemisphere`, `CosineHemisphere` (default), and
+`Importance`. Importance sampling uses AMD's face CDF and mip descent and requires
+a power-of-two map with a complete arithmetic-average mip chain down to 1x1;
+other maps use cosine sampling. Use the original radiance image, rather than
+Bevy's preconvolved `EnvironmentMapLight` images. GI does not draw the skybox.
 
 ## Implemented
 
 - Jittered screen probes with an adaptive second surface per tile, validated
   reprojection, and screen-continuity checks at visible geometry breaks.
-- Radiance-guided uniform-hemisphere sampling with mixture-PDF compensation;
-  hit-distance-based parallax redistribution of directional history.
-- Nine-coefficient spherical-harmonic projection and cosine-convolved diffuse
-  gathering; allocations match the configured 16 or 64 directional samples.
+- Persistent cached probes with projected candidates, shared restoration,
+  exclusive update ownership, parallel reservations and stable LRU/MRU compaction.
+- Full/quarter/sixteenth refresh, immediate disocclusion tracing and retained seeds.
+- Equal-area hemi-octahedral directions with material-weighted bounded GGX and
+  cosine/radiance guidance, a shared-memory CDF and mixture-PDF compensation;
+  half-packed RGB/hit distance and merged cached-neighbor directional history.
+- Probe-mask mip hierarchy and horizontal/vertical directional filtering with
+  reconnected endpoint-angle and depth rejection, feeding rough reflection reuse.
+- Source shadow-preserving directional hysteresis, blue-noise interpolation
+  jitter and low-confidence relaxed interpolation when every probe weight fails.
+- Raw cubemap lighting for probe misses, diffuse next-event samples, secondary
+  hit shading and glossy misses; rotation and mip-hierarchy importance sampling.
+- Source atlas-cell SH projection after directional filtering, with signed half
+  packing, source normalization and energy-spread backup for untraced cells.
+  `ProbeProjection::CompensatedRayIntegral` retains PDF-compensated projection
+  for physical reference comparisons. Allocations support 16 or 64 directions.
 - GPU compaction and indirect dispatch for active probes, first-hit cache cells,
   and touched cache cells.
-- Camera-distance-scaled world hash cells with expiry, full descriptor/material
-  checks, normal and surface-plane rejection, and uncached shading on misses.
+- Directional hash-cache tiles with PCG/xxHash descriptors, distance/FOV-based
+  sizing, 8x8/4x4/2x2/1x1 mips, half-float storage, atomic accumulation and expiry;
+  an auxiliary cache retains full material/normal/plane checks and miss fallback.
 - Separate direct/indirect estimators and explicit extra diffuse-bounce rays,
   using current direct light at secondary cells without recursive cache feedback.
 - Shadowed emissive triangles, directional, point, and spot lights, sampled from
   a weighted alias table with the correct marginal selection probability.
-- Eight-candidate world-space light RIS with previous-frame temporal and spatial
-  reservoir reuse, and one shadow ray for the selected light sample.
+- Streamed light-grid bounds from traced hits, volume-weighted reservoirs,
+  random/with-replacement/without-replacement merging, optional local resampling,
+  octahedral directional cells, light/cell volume overlap, parallel many-light
+  building, normalized-BRDF eight-candidate RIS, and one selected shadow ray. Temporal/spatial reservoir
+  reuse uses an independent world-space hash table, GPU count scan/compaction,
+  source packed normals/materials/reservoirs, four stochastically strided previous
+  candidates, bilateral rejection, M cap and selected shadow-ray invalidation.
+  Frame regions swap without copying reservoir history. Reuse defaults off.
+- Source area-light cone LOD for fresh RIS, shifted reservoir targets and selected
+  visibility samples, including transformed UV footprints and texture alpha.
 - Optional validated previous-HDR feedback at secondary hits, compensated for
   camera exposure. As upstream, feedback is disabled when multibounce is enabled.
-- Per-pixel emissive next-event sampling with diffuse/GGX evaluation; power-heuristic
-  MIS between area samples and cosine emitter rays reduces near-field fireflies.
-  Emitter hits are excluded from probe transport to avoid counting them twice.
-- GGX visible-normal glossy/mirror rays at one sample per 2x2 pixel block;
-  directional probe reuse replaces rays for rough surfaces, with a smooth transition.
-- Spatial probe filtering, demodulated irradiance reconstruction, validated bilinear
-  temporal history, luminance moments, variance-envelope history clipping, and
-  up to four edge-aware à-trous passes. Reflection filters also check the material.
+- Source atlas projection includes emitter hits. The compensated projection
+  instead uses per-pixel emissive next-event sampling and power-heuristic MIS,
+  excluding those hits from its SH integral to avoid counting them twice.
+- Bounded GGX visible-normal glossy/mirror rays at half or full resolution, a
+  half-quantized 32x32 BRDF LUT, original AMD blue-noise tables with source temporal
+  animation for tracing/filter jitter, endpoint/virtual-hit reprojection, firefly cleanup,
+  and separable or à-trous ratio reconstruction. Directional probes replace rays
+  for rough surfaces, with a smooth transition.
+- Spatial probe filtering and demodulated irradiance reconstruction. The default
+  diffuse denoiser uses GI-1.2's nine-tap reprojection, smoothed color delta,
+  adaptive/vignetted history cap and two separable disocclusion-blur passes.
+  A variance-clipped temporal/à-trous mode remains selectable.
 - Depth/normal-aware diffuse gathering;
   disoccluded surfaces without suitable probes get a traced fallback sample.
 - Secondary base-color/emissive/metallic-roughness textures, UV channels and
@@ -109,6 +158,7 @@ cargo run --example cornell -- --headless
 cargo run --example cornell -- --headless --software
 cargo run --example cornell -- --headless --hardware
 cargo test --all-targets
+cargo test --lib -- --include-ignored
 cargo test --tests -- --ignored --nocapture --test-threads=1
 cargo clippy --all-targets -- -D warnings
 ```
@@ -126,9 +176,11 @@ camera disable/re-enable, source deletion, bounced analytic lighting, mirror-onl
 reflections, textured emission, alpha masks, skinned/morphed source motion,
 and a viewport resize with an offset. Coplanar red/green boundaries
 must survive filtering, subpixel camera motion, and explicit camera cuts.
-Eleven unit checks cover
+Unit checks cover
 sampling probabilities, BVH structure, scene edits/capacity recovery, configuration,
-WGSL variants, deformation/refitting, emitter-source remapping, and Rust/shader memory layout.
+deformation/refitting, emitter-source remapping, and configuration. An ignored
+compiler check validates all eight Slang specializations and Rust/SPIR-V layouts.
+Native GPU fixtures check hash equations, LUT quantization, and light-grid weights.
 The separate floating-point furnace regression compares diffuse and glossy energy
 against analytical Lambertian lighting and an independent numerical GGX integral.
 See [validation](docs/validation.md), including the saved before/after captures.
@@ -140,24 +192,35 @@ not include scene extraction, BVH building, or GPU execution.
 
 ## Quality, cost, and limitations
 
-Start with 8-pixel probe spacing, 4x4 directions, and 32,768 world cells. Reducing
+Defaults use 8-pixel probe spacing, 8x8 directions, quarter-rate refresh, and
+32,768 world cells. `ProbeSamplingMode` selects full, quarter, or sixteenth refresh;
+invalid history traces fresh immediately. Reducing
 spacing from 8 to 4 quadruples probe work/storage. Increasing directions from 4
 to 8 quadruples probe-ray work/storage. `reflections = false` removes reflection
 rays; `multibounce = false` removes the extra cache-bounce rays. More direct samples
 reduce light-sampling noise at the cost of more shadow rays. Smaller cells reduce
 spatial bias but increase cache pressure and uncached work.
 
-Defaults use four next-event light samples and three spatial-filter passes.
-`denoise_iterations` accepts 0..=4; zero preserves temporal reconstruction only.
-`rough_reflection_threshold` controls when probe reuse starts (default 0.7).
+Defaults use four next-event light samples and adaptive separable diffuse denoising.
+`DiffuseDenoiser::TemporalVarianceAtrous` selects the variance filter;
+`denoise_iterations` then accepts 0..=4, with zero preserving temporal reconstruction only.
+`rough_reflection_threshold` controls when probe reuse starts (default 0.2);
+`reflection.high_roughness_threshold` sets the end of the transition (default 0.6).
+Reflection reconstruction has its own configuration and four à-trous passes by default.
 `adaptive_probes = false` releases the second layer's allocation. The ray capacity
 is fixed; compacted dispatches trace only valid slots. Extra surfaces beyond two
 still use the per-pixel fallback. The Cornell example also enables FXAA.
 
-At 640x640, defaults reserve 12,800 probes and 204,800 probe-ray records. GPU storage
-is approximately 103 MB per camera, excluding Bevy's own targets and scene buffers.
-A 1080p view uses approximately 488 MB; 4K can exceed storage-buffer limits. Use coarser
-probe spacing or a lower render resolution if allocation is rejected.
+At 640x640, defaults reserve 12,800 probes, 6,400 cached probes, and 819,200 probe-ray records. GPU storage
+is approximately 1.185 GB per camera, excluding Bevy's own targets and scene buffers.
+Enabling world-space reservoir reuse adds approximately 238 MB at that resolution.
+`WorldSpaceRestirConfig` controls its table capacity and distance/FOV footprint.
+Bevy's render-world `MainPassResolutionOverride` is supported; GI allocations,
+jitter, composition, feedback and cache footprints use the main-pass dimensions.
+The source-sized directional hash cache accounts for approximately 899 MB of this.
+A 1080p view uses approximately 2.401 GB; 4K can exceed storage-buffer limits.
+Reduce `hash_grid.num_buckets` for smaller caches, use coarser probe spacing, or
+lower the render resolution if allocation is rejected.
 
 Meshes must retain `RenderAssetUsages::MAIN_WORLD` for CPU BVH extraction.
 Secondary material texture sampling uses LOD zero; normal-map frames are derived
@@ -167,15 +230,17 @@ scattering is diffuse; nested glossy/mirror paths,
 caustics, and unlimited bounces are not implemented. Probe/world-cache interpolation
 is approximate and can blur detail or leak light despite surface rejection.
 Reflection reconstruction can blur sharp reflections and retain temporal artifacts.
-`MainPassResolutionOverride` is unsupported; those views skip GI composition.
+Render-world `MainPassResolutionOverride` resizes GI composition and histories.
 
-The remaining upstream differences include tiled/mipmapped hash caches, persistent
-probe relocation/LRU allocation, the streamed light grid and exact visibility
-reservoir stages, and Capsaicin's reflection hit reprojection, ratio estimator,
-and complete denoising stack. [The parity inventory](docs/gi12-parity.md) tracks
+The remaining upstream differences include probe atlas relocation/patch scheduling,
+source visibility-ID/renderer alignment, environment-light integration into the
+streamed RIS grid, and exact animated-surface history handling.
+Implemented hash-cache, grid and reflection stages still have differences in
+representation, sampling and scheduling. [The parity inventory](docs/gi12-parity.md) tracks
 these explicitly; this remains an incomplete port.
 Moving geometry performs synchronous CPU deformation/refitting, rebuilds the
-hardware scene, and resets the whole camera history. Correct animated geometry is
+hardware scene, and resets world/probe caches while motion vectors preserve
+compatible pixel histories. Correct animated geometry is
 tested; stable temporal lighting and large animated scenes still need further work.
 The historical Radiance
 Cascades assessment remains in [techniques.md](docs/techniques.md).

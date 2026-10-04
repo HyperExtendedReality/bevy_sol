@@ -1,6 +1,8 @@
-use crate::{GiRayBackend, GiSettings, HybridGi, raytracing::RayScene, scene::GiScene};
+use crate::{
+    GiEnvironmentMap, GiRayBackend, GiSettings, HybridGi, environment::EnvironmentRevision,
+    raytracing::RayScene, scene::GiScene,
+};
 use bevy::{
-    asset::{embedded_asset, load_embedded_asset},
     camera::MainPassResolutionOverride,
     core_pipeline::{
         Core3d, Core3dSystems,
@@ -14,45 +16,83 @@ use bevy::{
         diagnostic::RecordDiagnostics,
         render_asset::RenderAssets,
         render_resource::*,
-        renderer::{RenderContext, RenderDevice, RenderQueue, ViewQuery},
+        renderer::{RenderAdapterInfo, RenderContext, RenderDevice, RenderQueue, ViewQuery},
         texture::GpuImage,
         view::{ExtractedView, ViewTarget},
     },
 };
 use std::{borrow::Cow, num::NonZeroU32};
 const MATERIAL_TEXTURE_CAPACITY: u32 = 64;
+#[cfg(test)]
+#[path = "environment_tests.rs"]
+mod environment_tests;
+#[cfg(test)]
+#[path = "motion_tests.rs"]
+mod motion_tests;
+#[cfg(test)]
+#[path = "shader_tests.rs"]
+mod tests;
 fn texture_features() -> WgpuFeatures {
     WgpuFeatures::TEXTURE_BINDING_ARRAY
         | WgpuFeatures::PARTIALLY_BOUND_BINDING_ARRAY
         | WgpuFeatures::SAMPLED_TEXTURE_AND_STORAGE_BUFFER_ARRAY_NON_UNIFORM_INDEXING
 }
-fn textured_shader(source: &str) -> String {
-    source.replace(
-        "fn material_texture(index: u32, uv: vec2<f32>) -> vec4<f32> { return vec4(1.0); }",
-        include_str!("materials.wgsl"),
-    )
-}
 
-const CACHE_BYTES: u64 = 256;
+const CACHE_BYTES: u64 = 224;
 const RAY_BYTES: u64 = 144;
-const WORK_HEADER: u64 = 24;
-const BASE_STAGES: usize = 42;
-const STAGES: [&str; 46] = [
+const WORK_HEADER: u64 = 32;
+const BASE_STAGES: usize = 88;
+const STAGES: [&str; 92] = [
     "compute_brdf_lut",
     "reset_work",
+    "clear_light_grid_bounds",
     "clear_cache",
     "clear_hash_tiles",
+    "clear_restir",
+    "prepare_probe_cache",
+    "project_probe_cache",
     "spawn_probes",
+    "filter_probe_mask_1",
+    "filter_probe_mask_2",
+    "filter_probe_mask_3",
+    "filter_probe_mask_4",
+    "filter_probe_mask_5",
+    "filter_probe_mask_6",
+    "filter_probe_mask_7",
+    "filter_probe_mask_8",
+    "filter_probe_mask_9",
+    "filter_probe_mask_10",
+    "filter_probe_mask_11",
+    "filter_probe_mask_12",
+    "filter_probe_mask_13",
+    "filter_probe_mask_14",
+    "filter_probe_mask_15",
+    "reuse_cached_probes",
+    "scan_probe_cache_lru",
+    "scan_probe_cache_blocks",
+    "scatter_probe_cache_lru",
+    "allocate_probe_cache",
     "prepare_dispatch",
+    "prepare_probe_sampling",
     "trace_probes",
     "compact_primary_cells",
     "prepare_dispatch",
     "trace_cache_bounces",
     "trace_hash_bounces",
     "compact_touched_cells",
+    "calculate_light_grid_bounds",
     "prepare_dispatch",
+    "build_light_grid",
+    "build_light_grid_parallel",
     "initialize_hash_tiles",
     "generate_reservoirs",
+    "generate_restir",
+    "generate_restir_bounces",
+    "scan_restir_counts",
+    "scan_restir_blocks",
+    "add_restir_block_offsets",
+    "compact_restir",
+    "resample_restir",
     "update_cache_direct",
     "update_cache_indirect",
     "populate_hash_cells",
@@ -61,6 +101,9 @@ const STAGES: [&str; 46] = [
     "resolve_hash_bounces",
     "resolve_cache_bounces",
     "resolve_probes",
+    "filter_probe_radiance_x",
+    "filter_probe_radiance_y",
+    "project_probe_atlas",
     "filter_probes",
     "resolve_pixels",
     "mark_reflection_fireflies",
@@ -78,8 +121,16 @@ const STAGES: [&str; 46] = [
     "reflection_no_denoiser",
     "reproject_reflections",
     "filter_pixels",
+    "reproject_gi",
+    "filter_gi_x",
+    "filter_gi_y",
     "snapshot_reflections",
     "snapshot_cache",
+    "update_probe_cache",
+    "scan_probe_cache_lru",
+    "scan_probe_cache_blocks",
+    "scatter_probe_cache_lru",
+    "copy_probe_cache_lru",
     "atrous_1",
     "atrous_2",
     "atrous_4",
@@ -87,21 +138,77 @@ const STAGES: [&str; 46] = [
 ];
 
 fn probe_bytes(directions: u32) -> u64 {
-    80 + u64::from(directions.pow(2)) * 16 + 9 * 16 * 2
+    80 + u64::from(directions.pow(2)) * 16 + 9 * 8 * 2
+}
+fn probe_mask_levels(tiles: UVec2) -> u32 {
+    tiles.max_element().max(1).ilog2() + 1
+}
+fn probe_mask_words(tiles: UVec2) -> u64 {
+    (0..probe_mask_levels(tiles))
+        .map(|level| {
+            let dims = (tiles >> level).max(UVec2::ONE);
+            u64::from(dims.x) * u64::from(dims.y)
+        })
+        .sum()
 }
 
-fn specialized_shader(directions: u32) -> String {
-    format!(
-        "{}\n{}\n{}\n{}",
-        include_str!("hybrid.wgsl"),
-        include_str!("hash_grid.wgsl"),
-        include_str!("ggx.wgsl"),
-        include_str!("reflections.wgsl")
-    )
-    .replace(
-        "const PROBE_DIRECTIONS: u32 = 64u;",
-        &format!("const PROBE_DIRECTIONS: u32 = {}u;", directions.pow(2)),
-    )
+const SLANG_SOURCES: &[(&str, &str)] = &[
+    ("gi.slang", include_str!("shaders/gi.slang")),
+    ("hybrid.slang", include_str!("shaders/hybrid.slang")),
+    (
+        "environment.slang",
+        include_str!("shaders/environment.slang"),
+    ),
+    (
+        "screen_probes.slang",
+        include_str!("shaders/screen_probes.slang"),
+    ),
+    (
+        "probe_cache.slang",
+        include_str!("shaders/probe_cache.slang"),
+    ),
+    ("hash_grid.slang", include_str!("shaders/hash_grid.slang")),
+    ("ggx.slang", include_str!("shaders/ggx.slang")),
+    ("light_grid.slang", include_str!("shaders/light_grid.slang")),
+    (
+        "world_space_restir.slang",
+        include_str!("shaders/world_space_restir.slang"),
+    ),
+    (
+        "gi_denoiser.slang",
+        include_str!("shaders/gi_denoiser.slang"),
+    ),
+    (
+        "reflections.slang",
+        include_str!("shaders/reflections.slang"),
+    ),
+    ("materials.slang", include_str!("shaders/materials.slang")),
+    ("raytracing.slang", include_str!("shaders/raytracing.slang")),
+    ("packing.slang", include_str!("shaders/packing.slang")),
+    ("composite.slang", include_str!("shaders/composite.slang")),
+];
+fn compile_shader(
+    compiler: &bevy_slang::SlangCompiler,
+    entry: &str,
+    directions: u32,
+    hardware: bool,
+    textured: bool,
+) -> Shader {
+    compiler
+        .compile_bundle(
+            entry,
+            SLANG_SOURCES,
+            &bevy_slang::SlangSettings {
+                optimization: Some(2),
+                defines: vec![
+                    format!("PROBE_DIRECTIONS={}", directions.pow(2)),
+                    format!("GI_HARDWARE={}", u32::from(hardware)),
+                    format!("GI_TEXTURED={}", u32::from(textured)),
+                ],
+                ..default()
+            },
+        )
+        .unwrap_or_else(|error| panic!("bevy_sol: {error}"))
 }
 
 #[derive(Clone, Copy, Default, ShaderType)]
@@ -123,6 +230,13 @@ struct Params {
     reflection: UVec4,
     reflection_filter: Vec4,
     reflection_thresholds: Vec4,
+    light_grid: UVec4,
+    motion_clip_from_world: Mat4,
+    previous_motion_clip_from_world: Mat4,
+    environment_rotation: Vec4,
+    environment: Vec4,
+    restir: UVec4,
+    restir_sampling: Vec4,
 }
 #[derive(Clone, Copy, Default, ShaderType)]
 struct CompositeParams {
@@ -143,10 +257,145 @@ struct Pipelines {
 }
 #[derive(Resource)]
 struct HybridShader {
-    software: Handle<Shader>,
-    hardware: Handle<Shader>,
-    textured_software: Handle<Shader>,
-    textured_hardware: Handle<Shader>,
+    compute: Handle<Shader>,
+    composite: Handle<Shader>,
+    hardware: bool,
+    textured: bool,
+}
+#[derive(Resource)]
+struct GpuEnvironment {
+    fallback: TextureView,
+    view: TextureView,
+    sampler: Sampler,
+    rotation: Vec4,
+    intensity: f32,
+    sampling: f32,
+    width: f32,
+    levels: f32,
+    revision: u64,
+    source_revision: u64,
+}
+
+impl FromWorld for GpuEnvironment {
+    fn from_world(world: &mut World) -> Self {
+        let device = world.resource::<RenderDevice>();
+        // wgpu initializes this immutable fallback to zero before its first use.
+        let texture = device.create_texture(&TextureDescriptor {
+            label: Some("bevy_sol black environment"),
+            size: Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 6,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: TextureDimension::D2,
+            format: TextureFormat::Rgba16Float,
+            usage: TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let fallback = texture.create_view(&TextureViewDescriptor {
+            dimension: Some(TextureViewDimension::Cube),
+            ..default()
+        });
+        Self {
+            view: fallback.clone(),
+            fallback,
+            sampler: device.create_sampler(&SamplerDescriptor {
+                label: Some("bevy_sol environment point sampler"),
+                mag_filter: FilterMode::Nearest,
+                min_filter: FilterMode::Nearest,
+                mipmap_filter: MipmapFilterMode::Nearest,
+                ..default()
+            }),
+            rotation: Vec4::W,
+            intensity: 0.0,
+            sampling: 1.0,
+            width: 1.0,
+            levels: 1.0,
+            revision: 0,
+            source_revision: 0,
+        }
+    }
+}
+
+fn prepare_environment(
+    environment: Res<GiEnvironmentMap>,
+    source_revision: Res<EnvironmentRevision>,
+    images: Res<RenderAssets<GpuImage>>,
+    mut gpu: ResMut<GpuEnvironment>,
+) {
+    let valid = environment.validate().is_ok();
+    if !valid {
+        warn_once!(
+            "bevy_sol: invalid GiEnvironmentMap intensity or rotation; cubemap lighting disabled"
+        );
+    }
+    let image = valid
+        .then(|| {
+            environment
+                .image
+                .as_ref()
+                .and_then(|handle| images.get(handle))
+        })
+        .flatten();
+    let image = image.filter(|image| {
+        let d = &image.texture_descriptor;
+        let cube = d.dimension == TextureDimension::D2 && d.size.width == d.size.height
+            && d.size.depth_or_array_layers == 6 && d.sample_count == 1
+            && d.usage.contains(TextureUsages::TEXTURE_BINDING)
+            && image.texture_view_descriptor.as_ref().and_then(|v| v.dimension) == Some(TextureViewDimension::Cube)
+            && matches!(d.format.sample_type(None, None), Some(TextureSampleType::Float { .. }));
+        if !cube {
+            warn_once!("bevy_sol: GiEnvironmentMap requires a square six-layer float image with a Cube view; cubemap lighting disabled");
+        }
+        cube
+    });
+    let view = image
+        .map_or(&gpu.fallback, |image| &image.texture_view)
+        .clone();
+    if gpu.source_revision != source_revision.0 || gpu.view.id() != view.id() {
+        gpu.revision = gpu.revision.wrapping_add(1);
+        gpu.source_revision = source_revision.0;
+    }
+    gpu.view = view;
+    gpu.rotation = if valid {
+        Vec4::from_array(environment.rotation.normalize().conjugate().to_array())
+    } else {
+        Vec4::W
+    };
+    gpu.intensity = if image.is_some() {
+        environment.intensity
+    } else {
+        0.0
+    };
+    let (width, levels) = image.map_or((1, 1), |image| {
+        let d = &image.texture_descriptor;
+        let v = image.texture_view_descriptor.as_ref().unwrap();
+        (
+            (d.size.width >> v.base_mip_level).max(1),
+            v.mip_level_count
+                .unwrap_or(d.mip_level_count - v.base_mip_level),
+        )
+    });
+    gpu.width = width as f32;
+    gpu.levels = levels as f32;
+    gpu.sampling = match environment.sampling {
+        crate::EnvironmentSampling::UniformHemisphere => 0.0,
+        crate::EnvironmentSampling::CosineHemisphere => 1.0,
+        crate::EnvironmentSampling::Importance => {
+            if image.is_some() && width.is_power_of_two() && levels == width.ilog2() + 1 {
+                2.0
+            } else {
+                if image.is_some() {
+                    warn_once!(
+                        "bevy_sol: environment importance sampling needs a complete power-of-two mip chain; using cosine sampling"
+                    );
+                }
+                1.0
+            }
+        }
+    };
 }
 #[derive(Resource, Default)]
 struct GpuScene {
@@ -207,15 +456,22 @@ struct ViewGi {
     probes_count: u32,
     frames: u32,
     last_revision: u64,
+    last_history_revision: u64,
+    last_environment_revision: u64,
     last_reset: u64,
     previous_clip: Mat4,
+    previous_motion_clip: Mat4,
+    previous_camera: Vec3,
     params: UniformBuffer<Params>,
     composite_params: UniformBuffer<CompositeParams>,
     probes: Buffer,
     previous_probes: Buffer,
+    probe_cache: Buffer,
     cache: Buffer,
     hash_tiles: Buffer,
     reflections: Buffer,
+    light_grid: Buffer,
+    restir: Buffer,
     rays: Buffer,
     work: Buffer,
     indirect: Buffer,
@@ -242,44 +498,94 @@ struct ViewGi {
     composite_group: Option<BindGroup>,
     next_clip: Mat4,
     next_revision: u64,
+    next_history_revision: u64,
+    next_environment_revision: u64,
+    next_motion_clip: Mat4,
+    next_camera: Vec3,
     next_reset: u64,
     prepared: bool,
 }
 
 pub(crate) fn install(app: &mut App) {
-    embedded_asset!(app, "hybrid.wgsl");
-    embedded_asset!(app, "composite.wgsl");
     let settings = app.world().resource::<GiSettings>().clone();
+    let Some(render) = app.get_sub_app(RenderApp) else {
+        return;
+    };
+    let device = render.world().resource::<RenderDevice>();
+    let limits = device.limits();
+    let adapter = render.world().resource::<RenderAdapterInfo>();
+    if !bevy::render::settings::Backends::from(adapter.backend)
+        .contains(bevy::render::settings::Backends::VULKAN)
+        || !device
+            .features()
+            .contains(WgpuFeatures::PASSTHROUGH_SHADERS)
+    {
+        warn!("bevy_sol: Slang GI requires Vulkan and PASSTHROUGH_SHADERS; GI disabled");
+        return;
+    }
+    let hardware = settings.0.ray_backend != GiRayBackend::Software
+        && device
+            .features()
+            .contains(WgpuFeatures::EXPERIMENTAL_RAY_QUERY);
+    if settings.0.ray_backend == GiRayBackend::Hardware && !hardware {
+        warn!(
+            "bevy_sol: hardware traversal requires EXPERIMENTAL_RAY_QUERY in WgpuSettings; GI disabled"
+        );
+        return;
+    }
+    if limits.max_storage_buffers_per_shader_stage < 12
+        || limits.max_storage_textures_per_shader_stage < 4
+        || limits.max_sampled_textures_per_shader_stage < 12
+    {
+        warn!("bevy_sol: device does not support the hybrid GI binding requirements");
+        return;
+    }
+    let textured = device.features().contains(texture_features())
+        && limits.max_binding_array_elements_per_shader_stage >= MATERIAL_TEXTURE_CAPACITY * 2
+        && limits.max_binding_array_sampler_elements_per_shader_stage >= MATERIAL_TEXTURE_CAPACITY;
     let directions = settings.0.probe_directions;
-    let source = specialized_shader(directions);
-    let hardware_source = crate::raytracing::hardware_shader(&source);
+    let compiler = &settings.0.slang_compiler;
     let mut shaders = app.world_mut().resource_mut::<Assets<Shader>>();
-    let textured_software = shaders.add(Shader::from_wgsl(
-        textured_shader(&source),
-        "bevy_sol/textured_software.wgsl",
+    let mut compute = compile_shader(compiler, "gi.slang", directions, hardware, textured);
+    let bindings: Vec<_> = (0..=20)
+        .chain(hardware.then_some(21))
+        .chain([24, 25, 27, 28, 29, 30, 31, 32, 33])
+        .collect();
+    let mappings: Vec<_> = bindings
+        .iter()
+        .enumerate()
+        .map(|(physical, &binding)| bevy_slang::SpirvBindingRemap {
+            group: 0,
+            binding,
+            mapped_binding: physical as u32,
+        })
+        .collect();
+    bevy_slang::remap_spirv_bindings(&mut compute, &mappings).expect("GI descriptor layout");
+    let compute = shaders.add(compute);
+    let composite = shaders.add(compile_shader(
+        compiler,
+        "composite.slang",
+        directions,
+        false,
+        false,
     ));
-    let textured_hardware = shaders.add(Shader::from_wgsl(
-        textured_shader(&hardware_source),
-        "bevy_sol/textured_hardware.wgsl",
-    ));
-    let software = shaders.add(Shader::from_wgsl(source, "bevy_sol/hybrid.wgsl"));
-    let hardware = shaders.add(Shader::from_wgsl(hardware_source, "bevy_sol/hardware.wgsl"));
     let Some(render) = app.get_sub_app_mut(RenderApp) else {
         return;
     };
     render.insert_resource(HybridShader {
-        software,
+        compute,
         hardware,
-        textured_software,
-        textured_hardware,
+        textured,
+        composite,
     });
     render.insert_resource(settings);
     render
         .init_resource::<GpuScene>()
+        .init_resource::<GpuEnvironment>()
         .add_systems(RenderStartup, init_pipelines)
         .add_systems(
             Render,
-            (prepare_scene, prepare_views)
+            (prepare_environment, prepare_scene, prepare_views)
                 .chain()
                 .in_set(RenderSystems::PrepareBindGroups),
         )
@@ -318,32 +624,11 @@ fn texture_layout(binding: u32, sample_type: TextureSampleType) -> BindGroupLayo
 fn init_pipelines(
     mut commands: Commands,
     cache: Res<PipelineCache>,
-    assets: Res<AssetServer>,
     shader: Res<HybridShader>,
-    device: Res<RenderDevice>,
     settings: Res<GiSettings>,
 ) {
-    let limits = device.limits();
-    let hardware = settings.0.ray_backend != GiRayBackend::Software
-        && device
-            .features()
-            .contains(WgpuFeatures::EXPERIMENTAL_RAY_QUERY);
-    let textured = device.features().contains(texture_features())
-        && limits.max_binding_array_elements_per_shader_stage >= MATERIAL_TEXTURE_CAPACITY * 2
-        && limits.max_binding_array_sampler_elements_per_shader_stage >= MATERIAL_TEXTURE_CAPACITY;
-    if settings.0.ray_backend == GiRayBackend::Hardware && !hardware {
-        warn!(
-            "bevy_sol: hardware traversal requires EXPERIMENTAL_RAY_QUERY in WgpuSettings; GI disabled"
-        );
-        return;
-    }
-    if limits.max_storage_buffers_per_shader_stage < 9
-        || limits.max_storage_textures_per_shader_stage < 4
-        || limits.max_sampled_textures_per_shader_stage < 10
-    {
-        warn!("bevy_sol: device does not support the hybrid GI binding requirements");
-        return;
-    }
+    let hardware = shader.hardware;
+    let textured = shader.textured;
     let mut entries = vec![
         BindGroupLayoutEntry {
             binding: 0,
@@ -357,7 +642,7 @@ fn init_pipelines(
         },
         buffer_layout(1, true, 16),
         buffer_layout(2, true, 16),
-        buffer_layout(3, true, probe_bytes(settings.0.probe_directions)),
+        buffer_layout(3, false, probe_bytes(settings.0.probe_directions)),
         buffer_layout(4, false, probe_bytes(settings.0.probe_directions)),
         buffer_layout(5, false, CACHE_BYTES),
         buffer_layout(6, false, RAY_BYTES),
@@ -424,14 +709,35 @@ fn init_pipelines(
         TextureSampleType::Float { filterable: false },
     ));
     entries.push(buffer_layout(25, false, 64));
+    entries.push(buffer_layout(33, false, 64));
     entries.push(buffer_layout(27, false, 16384));
-    let layout = BindGroupLayoutDescriptor::new("bevy_sol hybrid", &entries);
-    let shader = match (hardware, textured) {
-        (false, false) => shader.software.clone(),
-        (true, false) => shader.hardware.clone(),
-        (false, true) => shader.textured_software.clone(),
-        (true, true) => shader.textured_hardware.clone(),
+    entries.push(buffer_layout(28, false, 96));
+    entries.push(buffer_layout(
+        29,
+        false,
+        16 + probe_bytes(settings.0.probe_directions),
+    ));
+    entries.push(texture_layout(
+        30,
+        TextureSampleType::Float { filterable: false },
+    ));
+    let mut environment_texture =
+        texture_layout(31, TextureSampleType::Float { filterable: false });
+    environment_texture.ty = BindingType::Texture {
+        sample_type: TextureSampleType::Float { filterable: false },
+        view_dimension: TextureViewDimension::Cube,
+        multisampled: false,
     };
+    entries.push(environment_texture);
+    entries.push(BindGroupLayoutEntry {
+        binding: 32,
+        visibility: ShaderStages::COMPUTE,
+        ty: BindingType::Sampler(SamplerBindingType::NonFiltering),
+        count: None,
+    });
+    let layout = BindGroupLayoutDescriptor::new("bevy_sol hybrid", &entries);
+    let composite_shader = shader.composite.clone();
+    let shader = shader.compute.clone();
     let compute = STAGES
         .iter()
         .map(|&entry| {
@@ -470,7 +776,7 @@ fn init_pipelines(
         entries.push(entry);
     }
     let composite_layout = BindGroupLayoutDescriptor::new("bevy_sol composite", &entries);
-    let shader = load_embedded_asset!(assets.as_ref(), "composite.wgsl");
+    let shader = composite_shader;
     let composite = cache.queue_render_pipeline(RenderPipelineDescriptor {
         label: Some(Cow::Borrowed("bevy_sol indirect lighting")),
         layout: vec![composite_layout.clone()],
@@ -678,14 +984,31 @@ fn allocate_view(device: &RenderDevice, size: UVec2, settings: &GiSettings) -> O
         .checked_mul(tiles.y)?
         .checked_mul(if c.adaptive_probes { 2 } else { 1 })?;
     let rays_count = probes_count.checked_mul(c.probe_directions.pow(2))?;
+    let cached_probes = u64::from(tiles.x) * u64::from(tiles.y);
     let limits = device.limits();
     let sizes = [
         u64::from(probes_count) * probe_bytes(c.probe_directions),
         u64::from(rays_count) * RAY_BYTES,
         u64::from(c.cache_capacity) * CACHE_BYTES,
-        (WORK_HEADER + u64::from(probes_count) + 2 * u64::from(c.cache_capacity)) * 4,
+        (WORK_HEADER
+            + u64::from(probes_count)
+            + 2 * u64::from(c.cache_capacity)
+            + probe_mask_words(tiles)
+            + 20
+            + 5 * cached_probes
+            + cached_probes.div_ceil(128)
+            + u64::from(probes_count))
+            * 4,
         c.hash_grid.bytes(),
         c.reflection.bytes(size),
+        c.light_grid.bytes(),
+        cached_probes * (16 + probe_bytes(c.probe_directions)),
+        (u64::from(probes_count) + cached_probes) * probe_bytes(c.probe_directions),
+        if c.reservoir_resampling {
+            c.world_space_restir.bytes(rays_count)
+        } else {
+            64
+        },
     ];
     if size.x == 0
         || size.y == 0
@@ -694,7 +1017,7 @@ fn allocate_view(device: &RenderDevice, size: UVec2, settings: &GiSettings) -> O
         || sizes
             .iter()
             .any(|&n| n > limits.max_storage_buffer_binding_size || n > limits.max_buffer_size)
-        || limits.max_storage_buffers_per_shader_stage < 9
+        || limits.max_storage_buffers_per_shader_stage < 12
         || limits.max_storage_textures_per_shader_stage < 4
     {
         warn_once!(
@@ -708,12 +1031,21 @@ fn allocate_view(device: &RenderDevice, size: UVec2, settings: &GiSettings) -> O
         probes_count,
         frames: 0,
         last_revision: 0,
+        last_history_revision: 0,
+        last_environment_revision: 0,
         last_reset: 0,
         previous_clip: Mat4::IDENTITY,
+        previous_motion_clip: Mat4::IDENTITY,
+        previous_camera: Vec3::ZERO,
         params: UniformBuffer::default(),
         composite_params: UniformBuffer::default(),
         probes: storage(device, "bevy_sol screen probes", sizes[0]),
-        previous_probes: storage(device, "bevy_sol previous probes", sizes[0]),
+        previous_probes: storage(
+            device,
+            "bevy_sol previous probes and cache restore",
+            sizes[8],
+        ),
+        probe_cache: storage(device, "bevy_sol persistent probe cache", sizes[7]),
         cache: storage(device, "bevy_sol world cache", sizes[2]),
         hash_tiles: storage(device, "bevy_sol directional hash tiles", sizes[4]),
         reflections: storage(
@@ -722,8 +1054,10 @@ fn allocate_view(device: &RenderDevice, size: UVec2, settings: &GiSettings) -> O
             sizes[5],
         ),
         rays: storage(device, "bevy_sol ray work", sizes[1]),
+        light_grid: storage(device, "bevy_sol streamed light grid", sizes[6]),
+        restir: storage(device, "bevy_sol world-space ReSTIR", sizes[9]),
         work: storage(device, "bevy_sol compact work and dispatch", sizes[3]),
-        indirect: storage(device, "bevy_sol indirect dispatch arguments", 80),
+        indirect: storage(device, "bevy_sol indirect dispatch arguments", 112),
         raw_diffuse: Image::new(device, size, TextureFormat::Rgba16Float),
         raw_specular: Image::new(device, size, TextureFormat::Rgba16Float),
         diffuse: Image::new(device, size, TextureFormat::Rgba16Float),
@@ -747,6 +1081,10 @@ fn allocate_view(device: &RenderDevice, size: UVec2, settings: &GiSettings) -> O
         composite_group: None,
         next_clip: Mat4::IDENTITY,
         next_revision: 0,
+        next_history_revision: 0,
+        next_environment_revision: 0,
+        next_motion_clip: Mat4::IDENTITY,
+        next_camera: Vec3::ZERO,
         next_reset: 0,
         prepared: false,
     })
@@ -757,6 +1095,7 @@ fn prepare_views(
     settings: Res<GiSettings>,
     scene: Res<GiScene>,
     gpu: Res<GpuScene>,
+    environment: Res<GpuEnvironment>,
     pipelines: Option<Res<Pipelines>>,
     cache: Res<PipelineCache>,
     device: Res<RenderDevice>,
@@ -789,12 +1128,6 @@ fn prepare_views(
         if let Some(state) = state.as_mut() {
             state.prepared = false;
         }
-        if resolution_override.is_some() {
-            warn_once!(
-                "bevy_sol: main-pass resolution overrides are not supported; GI skipped for this view"
-            );
-            continue;
-        }
         if *msaa != Msaa::Off
             || !camera.hdr
             || view.target_format != TextureFormat::Rgba16Float
@@ -806,23 +1139,63 @@ fn prepare_views(
             );
             continue;
         }
-        let (Some(_), Some(_)) = (prepass.depth_view(), prepass.deferred_view()) else {
+        let (Some(_), Some(_), Some(_)) = (
+            prepass.depth_view(),
+            prepass.deferred_view(),
+            prepass.motion_vectors_view(),
+        ) else {
             continue;
         };
-        let size = UVec2::new(view.viewport.z, view.viewport.w);
+        let viewport_size = UVec2::new(view.viewport.z, view.viewport.w);
+        let size = resolution_override.map_or(viewport_size, |size| size.0);
+        if size.x == 0 || size.y == 0 || size.x > viewport_size.x || size.y > viewport_size.y {
+            warn_once!(
+                "bevy_sol: main-pass resolution must be nonzero and fit the camera viewport"
+            );
+            continue;
+        }
         if state.as_ref().is_none_or(|s| s.size != size) {
             let Some(mut new) = allocate_view(&device, size, &settings) else {
                 continue;
             };
+            queue.write_buffer(
+                &new.reflections,
+                settings.0.reflection.bytes(size) - crate::reflections::BLUE_NOISE.len() as u64,
+                crate::reflections::BLUE_NOISE,
+            );
             prepare_view(
-                &mut new, view, camera, prepass, gi, &scene, &gpu, &pipelines, &cache, &device,
-                &queue, &settings, jitter,
+                &mut new,
+                view,
+                camera,
+                prepass,
+                gi,
+                &scene,
+                &gpu,
+                &pipelines,
+                &cache,
+                &device,
+                &queue,
+                &settings,
+                &environment,
+                jitter,
             );
             commands.entity(entity).insert(new);
         } else if let Some(mut state) = state {
             prepare_view(
-                &mut state, view, camera, prepass, gi, &scene, &gpu, &pipelines, &cache, &device,
-                &queue, &settings, jitter,
+                &mut state,
+                view,
+                camera,
+                prepass,
+                gi,
+                &scene,
+                &gpu,
+                &pipelines,
+                &cache,
+                &device,
+                &queue,
+                &settings,
+                &environment,
+                jitter,
             );
         }
     }
@@ -841,24 +1214,35 @@ fn prepare_view(
     device: &RenderDevice,
     queue: &RenderQueue,
     settings: &GiSettings,
+    environment: &GpuEnvironment,
     jitter: Option<&TemporalJitter>,
 ) {
     let c = &settings.0;
+    let main_viewport = UVec4::new(view.viewport.x, view.viewport.y, state.size.x, state.size.y);
     let mut projection = view.clip_from_view;
     let Some(data) = scene.data.as_ref() else {
         return;
     };
     let view_from_world = view.world_from_view.to_matrix().inverse();
+    let motion_clip = view.clip_from_world.unwrap_or(projection * view_from_world);
     let clip = if let Some(jitter) = jitter {
-        jitter.jitter_projection(&mut projection, view.viewport.zw().as_vec2());
+        jitter.jitter_projection(&mut projection, state.size.as_vec2());
         projection * view_from_world
     } else {
         view.clip_from_world.unwrap_or(projection * view_from_world)
     };
-    let reset = state.frames == 0
-        || state.last_revision != scene.revision
+    let history_reset = state.frames == 0
+        || state.last_history_revision != scene.history_revision
+        || state.last_environment_revision != environment.revision
         || state.last_reset != gi.reset
         || state.frames == u32::MAX;
+    let reset = if history_reset {
+        1
+    } else if state.last_revision != scene.revision {
+        2
+    } else {
+        0
+    };
     // Lighting invalidation clears estimators, not the random sequence. Repeated
     // scene edits must not freeze jitter and light samples at frame one.
     let frame = state.frames.checked_add(1).unwrap_or(1);
@@ -872,14 +1256,14 @@ fn prepare_view(
         camera_direction: (-*view.world_from_view.forward())
             .extend(1.0 / state.previous_exposure.max(1e-8)),
         sky: c.sky_radiance.extend(camera.exposure),
-        viewport: view.viewport,
+        viewport: main_viewport,
         screen: UVec4::new(
             state.tiles.x,
             state.tiles.y,
             c.probe_spacing,
             c.probe_directions,
         ),
-        frame: UVec4::new(frame, u32::from(reset), c.cache_capacity, c.direct_samples),
+        frame: UVec4::new(frame, reset, c.cache_capacity, c.direct_samples),
         scene_info: UVec4::new(
             data.node_count,
             (scene.lights.len() / 5) as u32,
@@ -913,7 +1297,13 @@ fn prepare_view(
                     && gi.intensity == 1.0
                     && state.previous_intensity == 1.0,
             ),
-            0.0,
+            f32::from(c.diffuse_denoiser == crate::DiffuseDenoiser::AdaptiveSeparable)
+                + 2.0
+                    * match c.probe_sampling {
+                        crate::ProbeSamplingMode::FullSpp => 0.0,
+                        crate::ProbeSamplingMode::QuarterSpp => 1.0,
+                        crate::ProbeSamplingMode::SixteenthSpp => 2.0,
+                    },
         ),
         hash_config: UVec4::new(
             c.hash_grid.num_buckets,
@@ -928,8 +1318,8 @@ fn prepare_view(
             if view.clip_from_view.w_axis.w == 1.0 {
                 c.cell_size_scale
             } else {
-                let height = view.viewport.w as f32;
-                let width = view.viewport.z as f32;
+                let height = state.size.y as f32;
+                let width = state.size.x as f32;
                 let fov = 2.0 * (1.0 / view.clip_from_view.y_axis.y).atan();
                 (fov * c.hash_grid.cell_size_pixels * (1.0 / height).max(height / (width * width)))
                     .clamp(1e-6, 1.5)
@@ -956,16 +1346,74 @@ fn prepare_view(
             c.reflection.firefly_low_threshold,
             c.reflection.firefly_high_threshold,
             f32::from(gi.intensity == 1.0 && state.previous_intensity == 1.0),
-            0.0,
+            if view.clip_from_view.w_axis.w == 1.0 {
+                0.0
+            } else {
+                let fov = 2.0 * (1.0 / view.clip_from_view.y_axis.y).atan();
+                let height = state.size.y as f32;
+                let width = state.size.x as f32;
+                (fov * c.probe_spacing as f32 * (1.0 / height).max(height / (width * width))).tan()
+            },
         ),
+        light_grid: UVec4::new(
+            c.light_grid.max_cells_per_axis,
+            c.light_grid.reservoirs_per_cell,
+            u32::from(c.light_grid.centroid_build)
+                | (u32::from(c.light_grid.octahedron_sampling) << 1)
+                | (u32::from(c.light_grid.cell_overlap) << 2)
+                | (u32::from(c.light_grid.parallel_build) << 3),
+            match c.light_grid.merge {
+                crate::LightGridMerge::Random => 0,
+                crate::LightGridMerge::WithoutReplacement => 1,
+                crate::LightGridMerge::WithReplacement => 2,
+            } | (u32::from(c.light_grid.resample) << 2),
+        ),
+        motion_clip_from_world: motion_clip,
+        previous_motion_clip_from_world: state.previous_motion_clip,
+        environment_rotation: environment.rotation,
+        environment: Vec4::new(
+            environment.intensity,
+            environment.sampling,
+            environment.width,
+            environment.levels,
+        ),
+        restir: UVec4::new(
+            c.world_space_restir.num_cells,
+            c.world_space_restir.entries_per_cell,
+            state.probes_count * c.probe_directions.pow(2) * 2,
+            u32::from(c.probe_projection == crate::ProbeProjection::SourceAtlas),
+        ),
+        restir_sampling: state
+            .previous_camera
+            .extend(if view.clip_from_view.w_axis.w == 1.0 {
+                c.cell_size_scale
+            } else {
+                let fov = 2.0 * (1.0 / view.clip_from_view.y_axis.y).atan();
+                let height = state.size.y as f32;
+                let width = state.size.x as f32;
+                (fov * c.world_space_restir.cell_size_pixels
+                    * (1.0 / height).max(height / (width * width)))
+                .clamp(1e-6, 1.5)
+                .tan()
+            }),
     });
     state.params.write_buffer(device, queue);
+    let cache_matrix_offset = (WORK_HEADER
+        + u64::from(state.probes_count)
+        + 2 * u64::from(c.cache_capacity)
+        + probe_mask_words(state.tiles)
+        + 4)
+        * 4;
+    let cache_matrix_columns = clip.to_cols_array();
+    let cache_matrix_bytes: [u8; 64] =
+        std::array::from_fn(|index| cache_matrix_columns[index / 4].to_le_bytes()[index % 4]);
+    queue.write_buffer(&state.work, cache_matrix_offset, &cache_matrix_bytes);
     state.composite_params.set(CompositeParams {
-        viewport: view.viewport,
+        viewport: main_viewport,
         multiplier: Vec4::new(
             gi.intensity * camera.exposure,
             f32::from(gi.reflections),
-            0.0,
+            f32::from(c.diffuse_denoiser == crate::DiffuseDenoiser::AdaptiveSeparable),
             0.0,
         ),
         camera: view
@@ -976,7 +1424,11 @@ fn prepare_view(
     });
     state.composite_params.write_buffer(device, queue);
     state.next_clip = clip;
+    state.next_camera = view.world_from_view.translation();
     state.next_revision = scene.revision;
+    state.next_history_revision = scene.history_revision;
+    state.next_environment_revision = environment.revision;
+    state.next_motion_clip = motion_clip;
     state.next_reset = gi.reset;
     state.prepared = true;
     let (
@@ -985,6 +1437,7 @@ fn prepare_view(
         Some(lights),
         Some(depth),
         Some(gbuffer),
+        Some(motion_vectors),
         Some(composite_params),
     ) = (
         state.params.binding(),
@@ -992,6 +1445,7 @@ fn prepare_view(
         gpu.lights.binding(),
         prepass.depth_view(),
         prepass.deferred_view(),
+        prepass.motion_vectors_view(),
         state.composite_params.binding(),
     )
     else {
@@ -1053,6 +1507,30 @@ fn prepare_view(
             binding: 27,
             resource: state.reflections.as_entire_binding(),
         });
+        entries.push(BindGroupEntry {
+            binding: 28,
+            resource: state.light_grid.as_entire_binding(),
+        });
+        entries.push(BindGroupEntry {
+            binding: 29,
+            resource: state.probe_cache.as_entire_binding(),
+        });
+        entries.push(BindGroupEntry {
+            binding: 30,
+            resource: BindingResource::TextureView(motion_vectors),
+        });
+        entries.push(BindGroupEntry {
+            binding: 31,
+            resource: BindingResource::TextureView(&environment.view),
+        });
+        entries.push(BindGroupEntry {
+            binding: 32,
+            resource: BindingResource::Sampler(&environment.sampler),
+        });
+        entries.push(BindGroupEntry {
+            binding: 33,
+            resource: state.restir.as_entire_binding(),
+        });
         device.create_bind_group(
             "bevy_sol compute",
             &cache.get_bind_group_layout(&pipelines.layout),
@@ -1112,10 +1590,14 @@ fn prepare_view(
     state.resolve_group = Some(resolve_group);
     state.filter_group = Some(filter_group);
     state.spatial_groups = spatial_groups;
-    let (final_d, final_s) = match c.denoise_iterations {
-        0 => (&state.diffuse, &state.specular),
-        n if n % 2 == 1 => (&state.spatial_diffuse, &state.spatial_specular),
-        _ => (&state.raw_diffuse, &state.raw_specular),
+    let (final_d, final_s) = if c.diffuse_denoiser == crate::DiffuseDenoiser::AdaptiveSeparable {
+        (&state.raw_diffuse, &state.raw_specular)
+    } else {
+        match c.denoise_iterations {
+            0 => (&state.diffuse, &state.specular),
+            n if n % 2 == 1 => (&state.spatial_diffuse, &state.spatial_specular),
+            _ => (&state.raw_diffuse, &state.raw_specular),
+        }
     };
     state.composite_group = Some(device.create_bind_group(
         "bevy_sol composite",
@@ -1201,7 +1683,31 @@ fn dispatch(
         }
         let reflection = &settings.0.reflection;
         let stage = STAGES[index];
+        let parallel_grid = settings.0.light_grid.parallel_build
+            && state.params.get().scene_info.y > 128 * settings.0.light_grid.reservoirs_per_cell;
         let enabled = match stage {
+            "project_probe_atlas" => {
+                settings.0.probe_projection == crate::ProbeProjection::SourceAtlas
+            }
+            name if name.contains("restir") => {
+                settings.0.reservoir_resampling
+                    && (name != "generate_restir_bounces" || settings.0.multibounce)
+            }
+            name if name.starts_with("filter_probe_mask_") => {
+                let level: u32 = name.rsplit('_').next().unwrap().parse().unwrap();
+                level < probe_mask_levels(state.tiles)
+            }
+            "filter_pixels" => {
+                settings.0.diffuse_denoiser == crate::DiffuseDenoiser::TemporalVarianceAtrous
+            }
+            "reproject_gi" | "filter_gi_x" | "filter_gi_y" => {
+                settings.0.diffuse_denoiser == crate::DiffuseDenoiser::AdaptiveSeparable
+            }
+            name if name.starts_with("atrous_") => {
+                settings.0.diffuse_denoiser == crate::DiffuseDenoiser::TemporalVarianceAtrous
+            }
+            "build_light_grid" => !parallel_grid,
+            "build_light_grid_parallel" => parallel_grid,
             "compute_brdf_lut" => state.frames == 0,
             "reflection_split_x" | "reflection_split_y" => {
                 reflection.denoiser == crate::ReflectionDenoiser::SplitRatioEstimator
@@ -1242,8 +1748,12 @@ fn dispatch(
         }
         pass.set_bind_group(
             0,
-            if STAGES[index] == "filter_pixels" {
+            if matches!(STAGES[index], "filter_pixels" | "reproject_gi") {
                 filter_group
+            } else if STAGES[index] == "filter_gi_x" {
+                &state.spatial_groups[0]
+            } else if STAGES[index] == "filter_gi_y" {
+                &state.spatial_groups[1]
             } else if index >= BASE_STAGES {
                 &state.spatial_groups[index - BASE_STAGES]
             } else {
@@ -1252,28 +1762,63 @@ fn dispatch(
             &[],
         );
         let indirect_offset = match STAGES[index] {
-            "trace_probes"
+            "build_light_grid" | "build_light_grid_parallel" => Some(96),
+            "resolve_probes"
+            | "filter_probe_radiance_x"
+            | "filter_probe_radiance_y"
+            | "project_probe_atlas" => Some(112),
+            "prepare_probe_sampling"
+            | "trace_probes"
             | "populate_hash_cells"
             | "trace_hash_bounces"
             | "populate_hash_bounces"
             | "resolve_hash_bounces" => Some(32),
+            "generate_restir" | "generate_restir_bounces" | "resample_restir" => Some(32),
             "initialize_hash_tiles" | "update_hash_tiles" => Some(80),
             "trace_cache_bounces" | "resolve_cache_bounces" => Some(48),
             "generate_reservoirs"
             | "update_cache_direct"
             | "update_cache_indirect"
             | "snapshot_cache" => Some(64),
-            "resolve_probes" | "filter_probes" => Some(16),
+            "filter_probes" | "update_probe_cache" => Some(16),
             _ => None,
         };
         if let Some(offset) = indirect_offset {
             pass.dispatch_workgroups_indirect(&state.indirect, offset - 16);
         } else {
             let (x, y, z) = match STAGES[index] {
+                name if name.starts_with("filter_probe_mask_") => {
+                    let level: u32 = name.rsplit('_').next().unwrap().parse().unwrap();
+                    let dims = (state.tiles >> level).max(UVec2::ONE);
+                    linear(dims.x * dims.y)
+                }
                 "compute_brdf_lut" => (4, 4, 1),
-                "reset_work" | "prepare_dispatch" => (1, 1, 1),
+                "reset_work"
+                | "prepare_dispatch"
+                | "clear_light_grid_bounds"
+                | "calculate_light_grid_bounds" => (1, 1, 1),
+                "scan_restir_blocks" => (1, 1, 1),
+                "clear_restir" | "add_restir_block_offsets" => {
+                    linear(settings.0.world_space_restir.entries())
+                }
+                "scan_restir_counts" => {
+                    let groups = settings.0.world_space_restir.entries().div_ceil(128);
+                    (groups.min(65535), groups.div_ceil(65535), 1)
+                }
+                "compact_restir" => linear(state.params.get().restir.z),
                 "clear_cache" | "compact_primary_cells" | "compact_touched_cells" => world,
                 "clear_hash_tiles" => linear(settings.0.hash_grid.tiles()),
+                "prepare_probe_cache"
+                | "project_probe_cache"
+                | "scatter_probe_cache_lru"
+                | "copy_probe_cache_lru" => linear(state.tiles.x * state.tiles.y),
+                "reuse_cached_probes" => linear(state.probes_count),
+                "allocate_probe_cache" => linear(state.probes_count),
+                "scan_probe_cache_blocks" => (1, 1, 1),
+                "scan_probe_cache_lru" => {
+                    let groups = (state.tiles.x * state.tiles.y).div_ceil(128);
+                    (groups.min(65535), groups.div_ceil(65535), 1)
+                }
                 "spawn_probes" => linear(state.probes_count),
                 _ => pixels,
             };
@@ -1282,8 +1827,8 @@ fn dispatch(
         drop(pass);
         if STAGES[index] == "prepare_dispatch" {
             // Indirect input cannot also be a read/write storage binding in the
-            // same dispatch. Copy the five argument records to a separate buffer.
-            encoder.copy_buffer_to_buffer(&state.work, 16, &state.indirect, 0, 80);
+            // same dispatch. Copy all seven argument records to a separate buffer.
+            encoder.copy_buffer_to_buffer(&state.work, 16, &state.indirect, 0, 112);
         }
         if let Some(timing) = stage_timing {
             timing.end(encoder);
@@ -1296,12 +1841,21 @@ fn dispatch(
         0,
         u64::from(state.probes_count) * probe_bytes(settings.0.probe_directions),
     );
-    state
-        .diffuse
-        .copy_to(&state.previous_diffuse, encoder, state.size);
-    state
-        .specular
-        .copy_to(&state.previous_specular, encoder, state.size);
+    if settings.0.diffuse_denoiser == crate::DiffuseDenoiser::AdaptiveSeparable {
+        state
+            .raw_diffuse
+            .copy_to(&state.previous_diffuse, encoder, state.size);
+        state
+            .raw_specular
+            .copy_to(&state.previous_specular, encoder, state.size);
+    } else {
+        state
+            .diffuse
+            .copy_to(&state.previous_diffuse, encoder, state.size);
+        state
+            .specular
+            .copy_to(&state.previous_specular, encoder, state.size);
+    }
     state
         .position
         .copy_to(&state.previous_position, encoder, state.size);
@@ -1351,67 +1905,10 @@ fn dispatch(
     state.previous_intensity = gi.intensity;
     state.frames = state.params.get().frame.x;
     state.previous_clip = state.next_clip;
+    state.previous_camera = state.next_camera;
     state.last_revision = state.next_revision;
+    state.last_history_revision = state.next_history_revision;
+    state.last_environment_revision = state.next_environment_revision;
+    state.previous_motion_clip = state.next_motion_clip;
     state.last_reset = state.next_reset;
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn shader_variants_validate_and_use_exact_probe_capacity() {
-        for directions in [4, 8] {
-            let software = specialized_shader(directions);
-            let hardware = crate::raytracing::hardware_shader(&software);
-            let textured = textured_shader(&software);
-            let textured_hardware = textured_shader(&hardware);
-            for source in [&software, &hardware, &textured, &textured_hardware] {
-                let module = naga::front::wgsl::parse_str(source)
-                    .unwrap_or_else(|e| panic!("{}", e.emit_to_string(source)));
-                naga::valid::Validator::new(
-                    naga::valid::ValidationFlags::all(),
-                    naga::valid::Capabilities::all(),
-                )
-                .validate(&module)
-                .unwrap_or_else(|e| panic!("{}", e.emit_to_string(source)));
-                let probe = module
-                    .types
-                    .iter()
-                    .find(|(_, t)| t.name.as_deref() == Some("Probe"))
-                    .unwrap()
-                    .1;
-                let naga::TypeInner::Struct { span, .. } = probe.inner else {
-                    panic!("Probe must be a struct")
-                };
-                assert_eq!(u64::from(span), probe_bytes(directions));
-                for entry in STAGES {
-                    assert!(
-                        module.entry_points.iter().any(|e| e.name == entry),
-                        "missing stage {entry}"
-                    );
-                }
-            }
-        }
-    }
-    #[test]
-    fn storage_and_uniform_layouts_match_wgsl() {
-        let module = naga::front::wgsl::parse_str(&specialized_shader(8)).unwrap();
-        for (name, bytes) in [
-            ("Probe", probe_bytes(8)),
-            ("CacheEntry", CACHE_BYTES),
-            ("RaySample", RAY_BYTES),
-            ("Params", Params::min_size().get()),
-        ] {
-            let ty = module
-                .types
-                .iter()
-                .find(|(_, ty)| ty.name.as_deref() == Some(name))
-                .unwrap()
-                .1;
-            let naga::TypeInner::Struct { span, .. } = ty.inner else {
-                panic!("expected struct")
-            };
-            assert_eq!(u64::from(span), bytes, "Rust/GPU buffer layout for {name}");
-        }
-    }
 }

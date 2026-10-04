@@ -90,17 +90,3 @@ impl RayScene {
         Self { tlas, revision }
     }
 }
-
-pub(crate) fn hardware_shader(software: &str) -> String {
-    let start = software
-        .find("fn trace_impl(")
-        .expect("trace_impl shader contract");
-    let end = software[start..]
-        .find("fn trace(")
-        .expect("trace shader contract")
-        + start;
-    let mut shader = software.to_owned();
-    shader.replace_range(start..end, include_str!("raytracing.wgsl"));
-    shader.insert_str(0, "enable wgpu_ray_query;\n");
-    shader
-}

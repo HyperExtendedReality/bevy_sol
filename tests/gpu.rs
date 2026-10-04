@@ -54,6 +54,25 @@ fn offscreen_emission_and_history_invalidation() {
     })
     .add_plugins(HybridGiPlugin {
         config: HybridGiConfig {
+            probe_sampling: match std::env::var("BEVY_SOL_TEST_PROBE_MODE").as_deref() {
+                Ok("full") => bevy_sol::ProbeSamplingMode::FullSpp,
+                Ok("sixteenth") => bevy_sol::ProbeSamplingMode::SixteenthSpp,
+                _ => bevy_sol::ProbeSamplingMode::QuarterSpp,
+            },
+            probe_directions: if std::env::var("BEVY_SOL_TEST_PROBE_DIRECTIONS").as_deref()
+                == Ok("8")
+            {
+                8
+            } else {
+                4
+            },
+            diffuse_denoiser: if std::env::var("BEVY_SOL_TEST_DIFFUSE_MODE").as_deref()
+                == Ok("atrous")
+            {
+                bevy_sol::DiffuseDenoiser::TemporalVarianceAtrous
+            } else {
+                bevy_sol::DiffuseDenoiser::AdaptiveSeparable
+            },
             reflection: bevy_sol::ReflectionConfig {
                 half_resolution: std::env::var("BEVY_SOL_TEST_FULL_REFLECTIONS").as_deref()
                     != Ok("1"),
@@ -70,6 +89,7 @@ fn offscreen_emission_and_history_invalidation() {
                 ..default()
             },
             temporal_feedback: feedback,
+            reservoir_resampling: std::env::var("BEVY_SOL_TEST_RESAMPLING").as_deref() == Ok("1"),
             multibounce: !feedback,
             ray_backend: if hardware {
                 GiRayBackend::Hardware

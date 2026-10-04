@@ -1,3 +1,6 @@
+// Source Sobol/ranking/scrambling tables, losslessly packed as bytes.
+pub(crate) const BLUE_NOISE: &[u8; 327680] = include_bytes!("data/gi12-blue-noise.bin");
+
 /// AMD's reflection reconstruction modes.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ReflectionDenoiser {
@@ -60,11 +63,28 @@ impl ReflectionConfig {
     }
     pub(crate) fn bytes(&self, size: bevy::prelude::UVec2) -> u64 {
         // 32x32 BRDF LUT, eight sample planes, four full-resolution planes,
-        // and two split-estimator intermediate planes.
+        // two split-estimator intermediate planes, and losslessly packed source
+        // blue-noise tables. The immutable tail needs no additional binding.
         let split_height = size.y.div_ceil(if self.half_resolution { 2 } else { 1 });
         16 * (1024
             + 8 * self.samples(size)
             + 4 * u64::from(size.x) * u64::from(size.y)
             + 2 * u64::from(size.x) * u64::from(split_height))
+            + BLUE_NOISE.len() as u64
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn original_blue_noise_tables_are_preserved() {
+        let checksum = BLUE_NOISE
+            .iter()
+            .fold(0xcbf2_9ce4_8422_2325u64, |hash, byte| {
+                (hash ^ u64::from(*byte)).wrapping_mul(0x100_0000_01b3)
+            });
+        assert_eq!(checksum, 0x1bec_05a1_e2d4_d117);
     }
 }

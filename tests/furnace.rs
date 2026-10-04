@@ -47,6 +47,7 @@ struct Measurement {
 #[ignore = "requires a compute-capable GPU"]
 fn uniform_environment_preserves_diffuse_and_glossy_energy() {
     let hardware = std::env::var("BEVY_SOL_TEST_HARDWARE").as_deref() == Ok("1");
+    let cubemap = std::env::var("BEVY_SOL_TEST_CUBEMAP").as_deref() == Ok("1");
     let mut wgpu = bevy::render::settings::WgpuSettings::default();
     if hardware {
         wgpu.features |= bevy::render::settings::WgpuFeatures::EXPERIMENTAL_RAY_QUERY;
@@ -73,6 +74,27 @@ fn uniform_environment_preserves_diffuse_and_glossy_energy() {
     .init_resource::<Measurement>()
     .add_plugins(HybridGiPlugin {
         config: HybridGiConfig {
+            // Physical reference integrals use the PDF-compensated estimator.
+            probe_projection: bevy_sol::ProbeProjection::CompensatedRayIntegral,
+            probe_sampling: match std::env::var("BEVY_SOL_TEST_PROBE_MODE").as_deref() {
+                Ok("full") => bevy_sol::ProbeSamplingMode::FullSpp,
+                Ok("sixteenth") => bevy_sol::ProbeSamplingMode::SixteenthSpp,
+                _ => bevy_sol::ProbeSamplingMode::QuarterSpp,
+            },
+            probe_directions: if std::env::var("BEVY_SOL_TEST_PROBE_DIRECTIONS").as_deref()
+                == Ok("8")
+            {
+                8
+            } else {
+                4
+            },
+            diffuse_denoiser: if std::env::var("BEVY_SOL_TEST_DIFFUSE_MODE").as_deref()
+                == Ok("atrous")
+            {
+                bevy_sol::DiffuseDenoiser::TemporalVarianceAtrous
+            } else {
+                bevy_sol::DiffuseDenoiser::AdaptiveSeparable
+            },
             reflection: ReflectionConfig {
                 half_resolution: std::env::var("BEVY_SOL_TEST_FULL_REFLECTIONS").as_deref()
                     != Ok("1"),
@@ -93,11 +115,47 @@ fn uniform_environment_preserves_diffuse_and_glossy_energy() {
             } else {
                 GiRayBackend::Software
             },
-            sky_radiance: Vec3::ONE,
+            sky_radiance: if cubemap {
+                Vec3::splat(0.25)
+            } else {
+                Vec3::ONE
+            },
             cache_capacity: 1024,
             ..default()
         },
     });
+    if cubemap {
+        use bevy::render::render_resource::{
+            Extent3d, TextureDimension, TextureViewDescriptor, TextureViewDimension,
+        };
+        let mut cube = Image::new(
+            Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 6,
+            },
+            TextureDimension::D2,
+            [1.0f32, 1.0, 1.0, 1.0]
+                .into_iter()
+                .cycle()
+                .take(24)
+                .flat_map(f32::to_le_bytes)
+                .collect(),
+            TextureFormat::Rgba32Float,
+            bevy::asset::RenderAssetUsages::default(),
+        );
+        cube.texture_view_descriptor = Some(TextureViewDescriptor {
+            dimension: Some(TextureViewDimension::Cube),
+            ..default()
+        });
+        let handle = app.world_mut().resource_mut::<Assets<Image>>().add(cube);
+        app.insert_resource(bevy_sol::GiEnvironmentMap {
+            image: Some(handle),
+            intensity: 0.75,
+            rotation: Quat::from_rotation_y(0.7),
+            sampling: bevy_sol::EnvironmentSampling::Importance,
+        });
+    }
     let mut image = Image::new_target_texture(64, 64, TextureFormat::Rgba32Float, None);
     image.texture_descriptor.usage |= bevy::render::render_resource::TextureUsages::COPY_SRC;
     let target = app.world_mut().resource_mut::<Assets<Image>>().add(image);
@@ -229,7 +287,14 @@ fn uniform_environment_preserves_diffuse_and_glossy_energy() {
                 );
                 break;
             }
-            assert!(Instant::now() < deadline, "glossy furnace did not converge");
+            assert!(
+                Instant::now() < deadline,
+                "glossy furnace did not converge: roughness={roughness}, frames={}, mean={}, range={}..{}",
+                result.frames,
+                result.mean,
+                result.min,
+                result.max
+            );
         }
     }
 }

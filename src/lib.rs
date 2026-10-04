@@ -1,16 +1,18 @@
 #![recursion_limit = "256"]
 //! GI-1.2-inspired hybrid lighting for Bevy 0.19.1.
 //! Rust manages screen probes, a world radiance cache, and reconstructed reflections.
-//! WGSL uses hardware ray queries or a software BVH; Bevy retains direct lighting.
+//! Slang/SPIR-V uses hardware ray queries or a software BVH; Bevy retains direct lighting.
+mod environment;
 mod gpu;
 mod hash_grid;
 mod light_grid;
 mod raytracing;
 mod reflections;
+mod restir;
 mod scene;
 use bevy::{
     camera::Hdr,
-    core_pipeline::prepass::{DeferredPrepass, DepthPrepass},
+    core_pipeline::prepass::{DeferredPrepass, DepthPrepass, MotionVectorPrepass},
     pbr::DefaultOpaqueRendererMethod,
     prelude::*,
     render::{
@@ -18,10 +20,41 @@ use bevy::{
         extract_resource::{ExtractResource, ExtractResourcePlugin},
     },
 };
+pub use environment::{EnvironmentSampling, GiEnvironmentMap};
 pub use hash_grid::HashGridCacheConfig;
 pub use light_grid::{LightGridConfig, LightGridMerge};
 pub use reflections::{ReflectionConfig, ReflectionDenoiser};
+pub use restir::WorldSpaceRestirConfig;
 pub use scene::GiStatistics;
+
+/// Diffuse temporal reconstruction and disocclusion filtering.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DiffuseDenoiser {
+    /// GI-1.2 adaptive history and horizontal/vertical disocclusion blur.
+    #[default]
+    AdaptiveSeparable,
+    /// Variance-clipped history followed by configurable à-trous passes.
+    TemporalVarianceAtrous,
+}
+
+/// Probe refresh density. Retained/reprojected probes stay available every frame.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ProbeSamplingMode {
+    FullSpp,
+    #[default]
+    QuarterSpp,
+    SixteenthSpp,
+}
+
+/// Conversion from directional probe radiance to diffuse SH.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ProbeProjection {
+    /// GI-1.2's filtered atlas-cell projection, including its source normalization.
+    #[default]
+    SourceAtlas,
+    /// PDF-compensated ray integral, useful for physical energy comparisons.
+    CompensatedRayIntegral,
+}
 
 /// Exclude a mesh from secondary-ray tracing. It can still receive GI.
 #[derive(Component)]
@@ -41,7 +74,7 @@ pub enum GiRayBackend {
 
 /// Enable GI on an HDR camera with `Msaa::Off`. Prepasses are inserted automatically.
 #[derive(Component, Clone, Copy, ExtractComponent)]
-#[require(Hdr, DepthPrepass, DeferredPrepass)]
+#[require(Hdr, DepthPrepass, DeferredPrepass, MotionVectorPrepass)]
 pub struct HybridGi {
     /// Finite, nonnegative multiplier for diffuse and specular indirect lighting.
     pub intensity: f32,
@@ -63,14 +96,19 @@ impl Default for HybridGi {
 /// Configure allocation and sampling before adding the plugin.
 #[derive(Clone, Debug)]
 pub struct HybridGiConfig {
+    pub probe_projection: ProbeProjection,
+    /// Slang compiler invoked once during shader initialization. Uses SLANGC/PATH by default.
+    pub slang_compiler: bevy_slang::SlangCompiler,
     pub ray_backend: GiRayBackend,
     /// Directional tiled radiance cache. Defaults match Capsaicin GI-1.2.
     pub hash_grid: HashGridCacheConfig,
     pub reflection: ReflectionConfig,
     pub light_grid: LightGridConfig,
+    pub diffuse_denoiser: DiffuseDenoiser,
+    pub probe_sampling: ProbeSamplingMode,
     /// Primary probe tile width: 4, 8, or 16 pixels.
     pub probe_spacing: u32,
-    /// 4 or 8; squared directions per probe. Default: 16 rays per 8x8 tile.
+    /// 4 or 8; squared directions per refreshed probe. Default: 64, as in GI-1.2.
     pub probe_directions: u32,
     /// Reserve a second probe for tiles containing incompatible surfaces.
     pub adaptive_probes: bool,
@@ -86,21 +124,24 @@ pub struct HybridGiConfig {
     pub max_ray_distance: f32,
     /// Surface offset and minimum intersection distance, in world units.
     pub ray_bias: f32,
-    /// Constant scene-linear environment radiance, not ambient irradiance.
+    /// Constant scene-linear radiance added to `GiEnvironmentMap` in all directions.
     pub sky_radiance: Vec3,
     /// Explicit extra transport bounce between world-cache cells.
     pub multibounce: bool,
-    /// 1..=8 weighted next-event samples per receiver pixel and cache update.
+    /// 1..=8 weighted next-event samples per receiver pixel and uncached shading.
     pub direct_samples: u32,
-    /// World-cache RIS with eight candidates and temporal/spatial reservoir reuse.
-    /// Primary emissive MIS and uncached shading retain next-event sampling.
+    /// Enable temporal/spatial reuse of the streamed-grid light reservoirs.
+    /// Fresh eight-candidate RIS is always used. Default false, as in GI-1.2.
+    /// Compensated probe projection and uncached shading retain next-event sampling.
     pub reservoir_resampling: bool,
+    /// Independent world-space table used when `reservoir_resampling` is enabled.
+    pub world_space_restir: WorldSpaceRestirConfig,
     /// Reuse validated previous HDR lighting at visible secondary hits.
     /// As in Capsaicin, enabled only when `multibounce` is false. Default: false.
     pub temporal_feedback: bool,
-    /// Temporal sample-count cap for probes, caches, and reconstructed pixels.
+    /// Temporal sample-count cap for probes/caches and the variance denoiser.
     pub history_samples: u32,
-    /// Edge-aware à-trous passes, 0..=4. Zero retains temporal reconstruction only.
+    /// Variance-denoiser à-trous passes, 0..=4. Adaptive mode uses two separable passes.
     pub denoise_iterations: u32,
     /// Low reflection roughness threshold. Above it, reuse directional probes.
     pub rough_reflection_threshold: f32,
@@ -112,12 +153,16 @@ pub struct HybridGiConfig {
 impl Default for HybridGiConfig {
     fn default() -> Self {
         Self {
+            probe_projection: ProbeProjection::default(),
+            slang_compiler: bevy_slang::SlangCompiler::default(),
             ray_backend: GiRayBackend::Auto,
             hash_grid: HashGridCacheConfig::default(),
             reflection: ReflectionConfig::default(),
             light_grid: LightGridConfig::default(),
+            diffuse_denoiser: DiffuseDenoiser::default(),
+            probe_sampling: ProbeSamplingMode::default(),
             probe_spacing: 8,
-            probe_directions: 4,
+            probe_directions: 8,
             adaptive_probes: true,
             cache_capacity: 32768,
             min_cell_size: 0.1,
@@ -128,7 +173,8 @@ impl Default for HybridGiConfig {
             sky_radiance: Vec3::ZERO,
             multibounce: true,
             direct_samples: 4,
-            reservoir_resampling: true,
+            reservoir_resampling: false,
+            world_space_restir: WorldSpaceRestirConfig::default(),
             temporal_feedback: false,
             history_samples: 32,
             denoise_iterations: 3,
@@ -143,6 +189,7 @@ impl HybridGiConfig {
         self.hash_grid.validate()?;
         self.reflection.validate(self.rough_reflection_threshold)?;
         self.light_grid.validate()?;
+        self.world_space_restir.validate()?;
         if ![4, 8, 16].contains(&self.probe_spacing) || ![4, 8].contains(&self.probe_directions) {
             return Err("probe_spacing must be 4/8/16 and probe_directions 4/8");
         }
@@ -192,19 +239,26 @@ impl Plugin for HybridGiPlugin {
             .insert_resource(DefaultOpaqueRendererMethod::deferred())
             .init_resource::<GiStatistics>()
             .init_resource::<scene::GiScene>()
+            .init_resource::<GiEnvironmentMap>()
+            .init_resource::<environment::EnvironmentRevision>()
             .add_plugins((
                 ExtractResourcePlugin::<GiSettings>::default(),
                 ExtractResourcePlugin::<scene::GiScene>::default(),
+                ExtractResourcePlugin::<GiEnvironmentMap>::default(),
+                ExtractResourcePlugin::<environment::EnvironmentRevision>::default(),
                 ExtractComponentPlugin::<HybridGi>::default(),
             ))
             .add_systems(
                 PostUpdate,
                 scene::update_scene.after(TransformSystems::Propagate),
             )
+            .add_systems(PostUpdate, environment::track_environment)
             .add_systems(
                 PostUpdate,
                 ensure_deferred_cameras.before(bevy::core_pipeline::core_3d::check_msaa),
             );
+    }
+    fn finish(&self, app: &mut App) {
         gpu::install(app);
     }
 }
@@ -274,26 +328,6 @@ mod tests {
             },
         ] {
             assert!(invalid.validate().is_err());
-        }
-    }
-    #[test]
-    fn standalone_gpu_programs_validate() {
-        let hybrid = format!(
-            "{}\n{}\n{}\n{}",
-            include_str!("hybrid.wgsl"),
-            include_str!("hash_grid.wgsl"),
-            include_str!("ggx.wgsl"),
-            include_str!("reflections.wgsl")
-        );
-        for source in [hybrid.as_str(), include_str!("composite.wgsl")] {
-            let module = naga::front::wgsl::parse_str(source)
-                .unwrap_or_else(|error| panic!("{}", error.emit_to_string(source)));
-            naga::valid::Validator::new(
-                naga::valid::ValidationFlags::all(),
-                naga::valid::Capabilities::all(),
-            )
-            .validate(&module)
-            .unwrap_or_else(|error| panic!("{}", error.emit_to_string(source)));
         }
     }
 }
