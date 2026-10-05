@@ -30,6 +30,7 @@ fn offscreen_emission_and_history_invalidation() {
     let hardware = std::env::var("BEVY_SOL_TEST_HARDWARE").as_deref() == Ok("1");
     let feedback = std::env::var("BEVY_SOL_TEST_FEEDBACK").as_deref() == Ok("1");
     let disable_alpha = std::env::var("BEVY_SOL_TEST_DISABLE_ALPHA").as_deref() == Ok("1");
+    let blend_alpha = std::env::var("BEVY_SOL_TEST_BLEND").as_deref() == Ok("1");
     let mut wgpu = bevy::render::settings::WgpuSettings::default();
     if hardware {
         wgpu.features |= bevy::render::settings::WgpuFeatures::EXPERIMENTAL_RAY_QUERY;
@@ -55,6 +56,11 @@ fn offscreen_emission_and_history_invalidation() {
     })
     .add_plugins(HybridGiPlugin {
         config: HybridGiConfig {
+            radiance_cascades: if std::env::var("BEVY_SOL_TEST_REFERENCE").as_deref() == Ok("1") {
+                None
+            } else {
+                Some(default())
+            },
             probe_sampling: match std::env::var("BEVY_SOL_TEST_PROBE_MODE").as_deref() {
                 Ok("full") => bevy_sol::ProbeSamplingMode::FullSpp,
                 Ok("sixteenth") => bevy_sol::ProbeSamplingMode::SixteenthSpp,
@@ -92,7 +98,8 @@ fn offscreen_emission_and_history_invalidation() {
             temporal_feedback: feedback,
             source_disable_alpha_testing: disable_alpha,
             reservoir_resampling: std::env::var("BEVY_SOL_TEST_RESAMPLING").as_deref() == Ok("1"),
-            multibounce: !feedback,
+            multibounce: !feedback
+                && std::env::var("BEVY_SOL_TEST_NO_MULTIBOUNCE").as_deref() != Ok("1"),
             ray_backend: if hardware {
                 GiRayBackend::Hardware
             } else {
@@ -330,7 +337,8 @@ fn offscreen_emission_and_history_invalidation() {
         builds_before_motion
     );
     assert!(app.world().resource::<GiStatistics>().bvh_refits >= 4);
-    // Both backends skip the transparent mask unless source traversal forces opaque.
+    // Both backends skip transparent mask/blend geometry unless forced opaque.
+    let unblocked_mean = app.world().resource::<Samples>().mean;
     let blocker_mesh = app
         .world_mut()
         .resource_mut::<Assets<Mesh>>()
@@ -340,7 +348,11 @@ fn offscreen_emission_and_history_invalidation() {
         .resource_mut::<Assets<StandardMaterial>>()
         .add(StandardMaterial {
             base_color: Color::srgba(0.0, 0.0, 0.0, 0.0),
-            alpha_mode: AlphaMode::Mask(0.5),
+            alpha_mode: if blend_alpha {
+                AlphaMode::Blend
+            } else {
+                AlphaMode::Mask(0.5)
+            },
             ..default()
         });
     let blocker = app
@@ -360,6 +372,22 @@ fn offscreen_emission_and_history_invalidation() {
                 s.mean > 0.08
             }
     });
+    if blend_alpha && !disable_alpha {
+        app.world_mut()
+            .resource_mut::<Assets<StandardMaterial>>()
+            .get_mut(&blocker_material)
+            .unwrap()
+            .base_color = Color::srgba(0.0, 0.0, 0.0, 0.5);
+        let generation = app.world().resource::<Samples>().generation;
+        pump_until(&mut app, |s| {
+            s.generation > generation + 40 && s.mean > 0.005 && s.mean < unblocked_mean * 0.95
+        });
+        println!(
+            "Stochastic blend blocker receiver mean: {:.4} versus unblocked {:.4}",
+            app.world().resource::<Samples>().mean,
+            unblocked_mean
+        );
+    }
     app.world_mut()
         .resource_mut::<Assets<StandardMaterial>>()
         .get_mut(&blocker_material)
@@ -369,6 +397,10 @@ fn offscreen_emission_and_history_invalidation() {
     pump_until(&mut app, |s| {
         s.generation > generation + 24 && s.mean < 0.001
     });
+    println!(
+        "Opaque blocker receiver mean: {:.6}",
+        app.world().resource::<Samples>().mean
+    );
     app.world_mut().despawn(blocker);
     let generation = app.world().resource::<Samples>().generation;
     pump_until(&mut app, |s| {

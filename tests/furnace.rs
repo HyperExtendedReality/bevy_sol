@@ -74,8 +74,19 @@ fn uniform_environment_preserves_diffuse_and_glossy_energy() {
     .init_resource::<Measurement>()
     .add_plugins(HybridGiPlugin {
         config: HybridGiConfig {
+            radiance_cascades: if std::env::var("BEVY_SOL_TEST_REFERENCE").as_deref() == Ok("1") {
+                None
+            } else {
+                Some(default())
+            },
             // Physical reference integrals use the PDF-compensated estimator.
-            probe_projection: bevy_sol::ProbeProjection::CompensatedRayIntegral,
+            probe_projection: if std::env::var("BEVY_SOL_TEST_SOURCE_PROJECTION").as_deref()
+                == Ok("1")
+            {
+                bevy_sol::ProbeProjection::SourceAtlas
+            } else {
+                bevy_sol::ProbeProjection::CompensatedRayIntegral
+            },
             probe_sampling: match std::env::var("BEVY_SOL_TEST_PROBE_MODE").as_deref() {
                 Ok("full") => bevy_sol::ProbeSamplingMode::FullSpp,
                 Ok("sixteenth") => bevy_sol::ProbeSamplingMode::SixteenthSpp,
@@ -172,8 +183,14 @@ fn uniform_environment_preserves_diffuse_and_glossy_energy() {
             perceptual_roughness: 1.0,
             ..default()
         });
-    app.world_mut()
-        .spawn((Mesh3d(mesh), MeshMaterial3d(material.clone())));
+    let receiver = app
+        .world_mut()
+        .spawn((
+            Mesh3d(mesh),
+            MeshMaterial3d(material.clone()),
+            Transform::IDENTITY,
+        ))
+        .id();
     let camera = app
         .world_mut()
         .spawn((
@@ -253,6 +270,39 @@ fn uniform_environment_preserves_diffuse_and_glossy_energy() {
             Instant::now() < deadline,
             "GI did not produce reference measurement"
         );
+    }
+    if std::env::var("BEVY_SOL_TEST_REFERENCE").as_deref() != Ok("1") {
+        for normal in [Vec3::X, Vec3::ONE.normalize()] {
+            let rotation = Quat::from_rotation_arc(Vec3::Z, normal);
+            app.world_mut()
+                .get_mut::<Transform>(receiver)
+                .unwrap()
+                .rotation = rotation;
+            *app.world_mut().get_mut::<Transform>(camera).unwrap() =
+                Transform::from_translation(normal * 3.0)
+                    .looking_at(Vec3::ZERO, rotation * Vec3::Y);
+            *app.world_mut().resource_mut::<Measurement>() = Measurement::default();
+            let deadline = Instant::now() + Duration::from_secs(60);
+            loop {
+                app.update();
+                assert!(app.world().resource::<Messages<AppExit>>().is_empty());
+                let result = app.world().resource::<Measurement>();
+                if result.frames >= 80 {
+                    let expected = 0.5 * Exposure { ev100: 0.0 }.exposure();
+                    println!(
+                        "Rotated Lambertian furnace normal={normal:?}: mean={:.6}, expected={expected:.6}",
+                        result.mean
+                    );
+                    assert!((result.mean - expected).abs() < expected * 0.05);
+                    assert!(result.max - result.min < 0.04);
+                    break;
+                }
+                assert!(Instant::now() < deadline, "rotated furnace timed out");
+            }
+        }
+        *app.world_mut().get_mut::<Transform>(receiver).unwrap() = Transform::IDENTITY;
+        *app.world_mut().get_mut::<Transform>(camera).unwrap() =
+            Transform::from_xyz(0.0, 0.0, 3.0).looking_at(Vec3::ZERO, Vec3::Y);
     }
     for roughness in [0.1, 0.35, 0.75] {
         {

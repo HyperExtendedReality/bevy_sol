@@ -12,6 +12,14 @@ It is not a complete port or a claim of equivalent performance or image quality.
 The [source mapping and architecture](docs/hybrid-gi.md) explain the differences.
 AMD's license is preserved in [third-party notices](THIRD_PARTY_NOTICES.md).
 
+## Radiance Cascades Transport
+
+The default configuration uses surface Radiance Cascades with world-space tracing
+and retains the screen-space and persistent world-space radiance caches.
+ReSTIR reuse is disabled on this path. See [architecture and acceptance status](docs/radiance-cascades.md).
+The GI-1.2 reference estimator remains available with `radiance_cascades: None`
+for matched comparisons. Better performance and quality are not yet established.
+
 ## Use
 
 ```rust
@@ -156,6 +164,10 @@ Bevy's preconvolved `EnvironmentMapLight` images. GI does not draw the skybox.
   disoccluded surfaces without suitable probes get a traced fallback sample.
 - Secondary base-color/emissive/metallic-roughness textures, UV channels and
   transforms, and alpha-mask candidate rejection in both backends. SourceAtlas
+  also traces `AlphaMode::Blend` using GI-1.2's mesh-position/frame xxHash
+  threshold. Disabling GI alpha testing forces opaque traversal and scales
+  blended emission by base alpha; Bevy primary raster visibility is unchanged.
+  SourceAtlas
   preserves sign-corrected cofactor-transformed vertex normals until face-oriented
   normalized interpolation at ray hits, as in GI-1.2;
   compensated mode additionally evaluates secondary normal maps.
@@ -270,6 +282,7 @@ tested; stable temporal lighting and large animated scenes still need further wo
 The historical Radiance
 Cascades assessment remains in [techniques.md](docs/techniques.md).
 
-Version 0.2 replaces `RadianceCascadesPlugin`/`RadianceCascadesConfig` and the fixed
+Version 0.2 replaces the historical `RadianceCascadesPlugin` and fixed
 `IrradianceVolume` API with `HybridGiPlugin`/`HybridGiConfig` and camera `HybridGi`.
-There is no fixed GI domain or cascade interval to configure.
+The new `RadianceCascadesConfig` controls surface-cascade intervals and angular
+resolution, not the historical fixed-volume implementation. There is no fixed GI domain.

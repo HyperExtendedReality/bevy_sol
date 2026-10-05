@@ -6,6 +6,7 @@ mod environment;
 mod gpu;
 mod hash_grid;
 mod light_grid;
+mod radiance_cascades;
 mod random;
 mod raytracing;
 mod reflections;
@@ -24,6 +25,7 @@ use bevy::{
 pub use environment::{EnvironmentSampling, GiEnvironmentMap};
 pub use hash_grid::HashGridCacheConfig;
 pub use light_grid::{LightGridConfig, LightGridMerge};
+pub use radiance_cascades::RadianceCascadesConfig;
 pub use random::RandomConfig;
 pub use reflections::{ReflectionConfig, ReflectionDenoiser};
 pub use restir::WorldSpaceRestirConfig;
@@ -98,6 +100,9 @@ impl Default for HybridGi {
 /// Configure allocation and sampling before adding the plugin.
 #[derive(Clone, Debug)]
 pub struct HybridGiConfig {
+    /// Default transport reconstruction. None selects the legacy GI-1.2 reference.
+    /// ReSTIR dispatches and allocations are disabled whenever cascades are enabled.
+    pub radiance_cascades: Option<RadianceCascadesConfig>,
     pub probe_projection: ProbeProjection,
     pub random: RandomConfig,
     /// Slang compiler invoked once during shader initialization. Uses SLANGC/PATH by default.
@@ -138,11 +143,12 @@ pub struct HybridGiConfig {
     /// Secondary material evaluation is unchanged. Ignored in compensated mode.
     pub source_disable_albedo_textures: bool,
     /// Force opaque GI closest-hit and shadow traversal in SourceAtlas.
+    /// Blend emission is scaled by base alpha when disabled; otherwise hits are stochastic.
     /// Bevy's primary raster alpha testing is unchanged. Ignored in compensated mode.
     pub source_disable_alpha_testing: bool,
     /// 1..=8 weighted next-event samples per receiver pixel and uncached shading.
     pub direct_samples: u32,
-    /// Enable temporal/spatial reuse of the streamed-grid light reservoirs.
+    /// Reference-mode only: temporal/spatial reuse of streamed-grid light reservoirs.
     /// Fresh eight-candidate RIS is always used. Default false, as in GI-1.2.
     /// Compensated probe projection and uncached shading retain next-event sampling.
     pub reservoir_resampling: bool,
@@ -165,6 +171,7 @@ pub struct HybridGiConfig {
 impl Default for HybridGiConfig {
     fn default() -> Self {
         Self {
+            radiance_cascades: Some(RadianceCascadesConfig::default()),
             probe_projection: ProbeProjection::default(),
             random: RandomConfig::default(),
             slang_compiler: bevy_slang::SlangCompiler::default(),
@@ -202,6 +209,9 @@ impl Default for HybridGiConfig {
 }
 impl HybridGiConfig {
     pub fn validate(&self) -> Result<(), &'static str> {
+        if let Some(cascades) = &self.radiance_cascades {
+            cascades.validate(self.max_ray_distance)?;
+        }
         self.hash_grid.validate()?;
         self.reflection.validate(self.rough_reflection_threshold)?;
         self.light_grid.validate()?;

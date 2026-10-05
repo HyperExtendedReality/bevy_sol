@@ -181,7 +181,7 @@ void reflection_trace(uint2 pixel, Surface s, uint seed) {
                     else {
                         let jitter = reflection_cache_jitter(n,hash_cell_size(position),samples);
                         var found=false;
-                        let cached=directional_cached_radiance(position+jitter,direction,hit.distance,found);
+                        let cached=directional_cached_radiance(position+jitter,direction,hit.distance,found,cascades_active(),n);
                         if (found) { radiance = cached;distance=hit.distance; }
                         else if(!source_probe_projection()) { radiance = cached_radiance(position,n,hit.distance,hit.triangle,seed,MISSING,direction); }
                     }

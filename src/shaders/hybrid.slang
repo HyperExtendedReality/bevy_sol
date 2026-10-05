@@ -1,6 +1,9 @@
 // GI-1.2 Rust/Slang adaptation. Reference: AMD Capsaicin commit
 // 914b91596cd119eda85fbc1d3c7ee6ac391b1452, gi1.comp and hash_grid_cache.hlsl.
 // See THIRD_PARTY_NOTICES.md. Compiled to native SPIR-V with bevy_slang.
+#ifndef GI_RADIANCE_CASCADES
+#define GI_RADIANCE_CASCADES 0
+#endif
 struct Params {
     var world_from_clip: float4x4;
     var previous_clip_from_world: float4x4;
@@ -26,7 +29,18 @@ struct Params {
     var environment: float4;
     var restir: uint4;
     var restir_sampling: float4;
+#if GI_RADIANCE_CASCADES
+    var cascades: uint4;
+    var cascade_sampling: float4;
+#endif
 };
+bool cascades_active() {
+#if GI_RADIANCE_CASCADES
+    return (p.restir.w&16u)!=0u;
+#else
+    return false;
+#endif
+}
 struct Probe {
     var position: float4;
     var normal: float4;
@@ -151,13 +165,25 @@ float3 probe_irradiance(uint index, float3 n) {
 uint compact_probe(uint lane) { return work[WORK_HEADER + lane].load(); }
 uint compact_primary(uint lane) { return work[WORK_HEADER + p.scene_info.z + lane].load(); }
 uint compact_cell(uint lane) { return work[WORK_HEADER + p.scene_info.z + p.frame.z + lane].load(); }
+uint transport_ray_count() {
+#if GI_RADIANCE_CASCADES
+    if(cascades_active()) {return p.cascades.w;}
+#endif
+    return work[27].load()*p.screen.w*p.screen.w;
+}
+uint transport_ray_index(uint lane) {
+#if GI_RADIANCE_CASCADES
+    if(cascades_active()) {return lane;}
+#endif
+    let count=p.screen.w*p.screen.w;return compact_fresh_probe(lane/count)*count+lane%count;
+}
 [shader("compute")][numthreads(1,1,1)]
 void reset_work() {
     for (var i = 0u; i < WORK_HEADER; i++) { work[i].store(0u); }
 }
 [shader("compute")][numthreads(1,1,1)]
 void prepare_dispatch() {
-    let counts = uint[4](work[0].load(), work[27].load() * p.screen.w * p.screen.w,
+    let counts = uint[4](work[0].load(), transport_ray_count(),
         work[1].load(), work[2].load());
     for (var i = 0u; i < 4u; i++) {
         work[4u + i * 4u].store((min(counts[i], 65536u) + 63u) / 64u);
@@ -276,12 +302,12 @@ bool hit_box(float3 o, float3 d, float3 lo, float3 hi, float near, float far) {
 #if GI_HARDWARE
 #include "raytracing.slang"
 #else
-Hit trace_impl(float3 o, float3 d, float far, bool any_hit) {
+Hit trace_impl_range(float3 o, float3 d, float near, float far, bool any_hit) {
     var hit = Hit(far, MISSING, float2(0.0)); var node = 0u;
     while ((true)) {
         if (node >= p.scene_info.x) { break; }
         let lo = geometry[node * 2u]; let hi = geometry[node * 2u + 1u];
-        if (!hit_box(o, d, lo.xyz, hi.xyz, p.cache_config.z, hit.distance)) { node = uint(hi.w); continue; }
+        if (!hit_box(o, d, lo.xyz, hi.xyz, near, hit.distance)) { node = uint(hi.w); continue; }
         if (lo.w >= 0.0) {
             let index = uint(lo.w); let a = geometry[index].xyz;
             let e1 = geometry[index + 1u].xyz - a; let e2 = geometry[index + 2u].xyz - a;
@@ -289,7 +315,7 @@ Hit trace_impl(float3 o, float3 d, float far, bool any_hit) {
             if (abs(det) > 1e-8) {
                 let inv = 1.0 / det; let s = o - a; let u = dot(s, h) * inv;
                 let q = cross(s, e1); let v = dot(d, q) * inv; let t = dot(e2, q) * inv;
-                if (u >= 0.0 && v >= 0.0 && u + v <= 1.0 && t >= p.cache_config.z && t < hit.distance && material_ray_visible(index, float2(u, v),det>0.0)) {
+                if (u >= 0.0 && v >= 0.0 && u + v <= 1.0 && t >= near && t < hit.distance && material_ray_visible(index, float2(u, v),det>0.0)) {
                     hit = Hit(t, index, float2(u, v)); if (any_hit) { return hit; }
                 }
             }
@@ -299,6 +325,7 @@ Hit trace_impl(float3 o, float3 d, float far, bool any_hit) {
     return hit;
 }
 #endif
+Hit trace_impl(float3 o,float3 d,float far,bool any_hit) {return trace_impl_range(o,d,p.cache_config.z,far,any_hit);}
 Hit trace(float3 o, float3 d, float far) { return trace_impl(o, d, far, false); }
 float3 geometric_normal(uint t) {
     return normalize(cross(geometry[t + 1u].xyz - geometry[t].xyz, geometry[t + 2u].xyz - geometry[t].xyz));
@@ -913,7 +940,7 @@ void trace_probes(uint3 gid : SV_DispatchThreadID) {
     let position = origin + ray * hit.distance;
     request_light_location(position);
     rays[index].position = float4(position, 1.0); rays[index].normal = float4(n, float(hit.distance < hash_cell_size(position)));
-    rays[index].info.w = hash_tile_insert(position, ray, hit.distance);
+    rays[index].info.w = hash_tile_insert(position, ray, hit.distance,n);
     if(source_probe_projection()) {
         if(rays[index].info.w==MISSING) {rays[index].info.z=MISSING;return;}
         let query=source_append_visibility(index,false);
@@ -1006,9 +1033,9 @@ void resolve_cache_bounces(uint3 gid : SV_DispatchThreadID) {
 }
 float3 cached_radiance(float3 position, float3 n, float distance, uint triangle, uint seed, uint hint, float3 direction) {
     if(source_probe_projection()) {
-        var found=false;return directional_cached_radiance(position,direction,distance,found);
+        var found=false;return directional_cached_radiance(position,direction,distance,found,cascades_active(),n);
     }
-    let cell = hash_tile_find(position, direction, distance);
+    let cell = hash_tile_find(position, direction, distance,n);
     if (cell != MISSING) {
         let value = hash_radiance(cell);
         if (value.w > 0.0) { hash_touch(cell); return value.rgb + material_emission(position, triangle); }
@@ -1223,8 +1250,9 @@ ProbeInterpolation source_probe_interpolation(Surface s,uint2 pixel) {
 }
 float4 source_diffuse_interpolation(Surface s,ProbeInterpolation interpolation) {
     var value=float3(0.0);
+    let normal=surface_shading_normal(s);
     for(var i=0u;i<4u;i++) {
-        if(interpolation.indices[i]!=MISSING) {value+=interpolation.weights[i]*probe_irradiance(interpolation.indices[i],s.geometry_normal);}
+        if(interpolation.indices[i]!=MISSING) {value+=interpolation.weights[i]*probe_irradiance(interpolation.indices[i],normal);}
     }
     return float4(value,interpolation.hint);
 }
@@ -1239,6 +1267,9 @@ float4 source_directional_interpolation(ProbeInterpolation interpolation,float3 
     return float4(value,interpolation.hint);
 }
 float4 gather_diffuse(Surface s, uint2 pixel) {
+#if GI_RADIANCE_CASCADES
+    if(cascades_active()) {return cascade_gather_diffuse(s,pixel);}
+#endif
     if(source_probe_projection()) {return source_diffuse_interpolation(s,source_probe_interpolation(s,pixel));}
     let scale=footprint(s,pixel);
     let cell_size=max(select(p.camera.w!=0.0,scale,
@@ -1322,7 +1353,7 @@ void resolve_pixels(uint3 gid : SV_DispatchThreadID) {
     var view = normalize(p.camera.xyz - s.position); if (p.camera.w != 0.0) { view = p.camera_direction.xyz; }
     let f0 = lerp(float3(0.16 * s.reflectance * s.reflectance), s.base, s.metallic);
     var direct = Lighting(float3(0.0), float3(0.0)); var indirect = float4(0.0,0.0,0.0,1.0);
-    if (s.metallic < 0.999 && !source_probe_projection()) {
+    if (s.metallic < 0.999 && !source_probe_projection() && !cascades_active()) {
         direct = light_transport(s.position, s.normal, s.position + s.normal * p.cache_config.z,
             seed + 79u, true, float3(0.0), view, s.roughness);
     }
@@ -1334,6 +1365,9 @@ void resolve_pixels(uint3 gid : SV_DispatchThreadID) {
     output_specular[coord] = float4(0.0);
 }
 float4 gather_directional(Surface s, uint2 pixel, float3 direction) {
+#if GI_RADIANCE_CASCADES
+    if(cascades_active()) {return cascade_gather_directional(s,pixel,direction);}
+#endif
     if(source_probe_projection()) {return source_directional_interpolation(source_probe_interpolation(s,pixel),direction);}
     let base = int2(pixel / p.screen.z); let scale = footprint(s, pixel);
     var color = float3(0.0); var total = 0.0;

@@ -47,7 +47,7 @@ fn amd_hashing_half_packing_tile_mips_temporal_update_and_decay() {
     };
     let uniform = buffer(
         "hash reference params",
-        576,
+        608,
         BufferUsages::UNIFORM | BufferUsages::COPY_DST,
     );
     let work = buffer(
@@ -85,7 +85,7 @@ fn amd_hashing_half_packing_tile_mips_temporal_update_and_decay() {
         1024,
         BufferUsages::MAP_READ | BufferUsages::COPY_DST,
     );
-    let mut words = [0u32; 144];
+    let mut words = [0u32; 152];
     words[48..52].copy_from_slice(&[4, 3, 8, 8]); // Probe mask dimensions, spacing, directions
     words[58] = 24; // Reserved primary/secondary probes
     words[60] = 0.1f32.to_bits(); // Params.cache_config.x
@@ -183,10 +183,22 @@ fn amd_hashing_half_packing_tile_mips_temporal_update_and_decay() {
                     "packing.slang",
                     include_str!("../src/shaders/packing.slang"),
                 ),
+                (
+                    "radiance_cascades.slang",
+                    include_str!("../src/shaders/radiance_cascades.slang"),
+                ),
+                (
+                    "radiance_cascade_math.slang",
+                    include_str!("../src/shaders/radiance_cascade_math.slang"),
+                ),
             ],
             &bevy_slang::SlangSettings {
                 optimization: Some(2),
-                defines: vec!["GI_HARDWARE=0".into(), "GI_TEXTURED=0".into()],
+                defines: vec![
+                    "GI_HARDWARE=0".into(),
+                    "GI_TEXTURED=0".into(),
+                    "GI_RADIANCE_CASCADES=1".into(),
+                ],
                 ..default()
             },
         )
@@ -813,6 +825,109 @@ fn amd_hashing_half_packing_tile_mips_temporal_update_and_decay() {
         let values = readback(encoder);
         assert_eq!(values[0], if source == 1 { u32::MAX } else { values[1] });
     }
+    let pipeline = make_pipeline("read_source_diffuse_normal_test");
+    words[139] = 1;
+    queue.write_buffer(
+        &uniform,
+        0,
+        &words
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect::<Vec<_>>(),
+    );
+    let mut encoder = device.create_command_encoder(&CommandEncoderDescriptor::default());
+    {
+        let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor::default());
+        pass.set_pipeline(&pipeline);
+        pass.set_bind_group(0, &group, &[]);
+        pass.dispatch_workgroups(1, 1, 1);
+    }
+    let values = readback(encoder);
+    // Independent source RGB10 decode/normalization and l=1 cosine convolution.
+    let small = 1.0_f64 / 1023.0;
+    let normal_x = 1.0 / (1.0 + 2.0 * small * small).sqrt();
+    let expected = 0.4886025119029199 * normal_x * (2.0 / 3.0);
+    for (channel, scale) in [1.0, 2.0, 4.0].into_iter().enumerate() {
+        assert!(
+            (f64::from(f32::from_bits(values[channel])) - expected * scale).abs() < 2e-6,
+            "source diffuse SH must use shading/details normal, not placement geometry normal"
+        );
+    }
+    assert_eq!(f32::from_bits(values[3]), 1.0);
+    let pipeline = make_pipeline("read_empty_directional_cache_test");
+    let mut encoder = device.create_command_encoder(&CommandEncoderDescriptor::default());
+    {
+        let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor::default());
+        pass.set_pipeline(&pipeline);
+        pass.set_bind_group(0, &group, &[]);
+        pass.dispatch_workgroups(1, 1, 1);
+    }
+    let values = readback(encoder);
+    assert_eq!(
+        values[0], 0,
+        "empty tile is not a populated cascade estimate"
+    );
+    assert_eq!(f32::from_bits(values[1]), 0.0);
+    assert_eq!(
+        values[2], 1,
+        "reference mode preserves tile-presence lookup"
+    );
+    assert_eq!(values[3], 1, "a valid black sample must not fall back");
+    assert_eq!(f32::from_bits(values[4]), 0.0);
+    assert_eq!(values[5], 1);
+    for (channel, sum) in [2.0, 4.0, 8.0].into_iter().enumerate() {
+        assert_eq!(f32::from_bits(values[6 + channel]), sum / 16.0);
+    }
+    assert_eq!(values[9], 0, "absent tile must fall back");
+    assert_eq!(f32::from_bits(values[10]), 0.0);
+    assert_eq!(
+        values[11], 0,
+        "indirect-only tile still needs fresh direct lighting"
+    );
+    for (channel, sum) in [2.0, 4.0, 8.0].into_iter().enumerate() {
+        assert_eq!(f32::from_bits(values[12 + channel]), sum / 16.0);
+    }
+    let pipeline = make_pipeline("read_sparse_hash_update_test");
+    for cascades in [false, true] {
+        words[139] = 1 | (u32::from(cascades) << 4);
+        queue.write_buffer(
+            &uniform,
+            0,
+            &words
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect::<Vec<_>>(),
+        );
+        let mut encoder = device.create_command_encoder(&CommandEncoderDescriptor::default());
+        {
+            let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor::default());
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(0, &group, &[]);
+            pass.dispatch_workgroups(1, 1, 1);
+        }
+        let values = readback(encoder);
+        let expected = if cascades {
+            [2.0, 4.0, 8.0, 2.0, 0.5, 1.0, 2.0, 4.0]
+        } else {
+            [1.0, 2.0, 4.0, 1.0, 0.375, 0.75, 1.5, 3.0]
+        };
+        for (word, expected) in values[..8].iter().zip(expected) {
+            assert_eq!(
+                f32::from_bits(*word),
+                expected,
+                "empty sparse update: cascades={cascades}"
+            );
+        }
+        assert_eq!(
+            values[8..12]
+                .iter()
+                .map(|v| f32::from_bits(*v))
+                .collect::<Vec<_>>(),
+            [2.0, 4.0, 8.0, 3.0],
+            "valid black sample still lowers the estimate"
+        );
+    }
+    words[139] = 1;
     words[52] = 0;
     let bytes: Vec<_> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
     queue.write_buffer(&uniform, 0, &bytes);
@@ -830,4 +945,40 @@ fn amd_hashing_half_packing_tile_mips_temporal_update_and_decay() {
         "64 concurrent first touches enqueue one tile at frame zero"
     );
     assert!(values[4..68].iter().all(|cell| *cell == values[1]));
+    let pipeline = make_pipeline("read_hash_depth_layer_test");
+    for cascades in [false, true] {
+        words[139] = 1 | (u32::from(cascades) << 4);
+        queue.write_buffer(
+            &uniform,
+            0,
+            &words
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect::<Vec<_>>(),
+        );
+        let mut encoder = device.create_command_encoder(&CommandEncoderDescriptor::default());
+        {
+            let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor::default());
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(0, &group, &[]);
+            pass.dispatch_workgroups(1, 1, 1);
+        }
+        let values = readback(encoder);
+        for pair in values[..6].as_chunks::<2>().0 {
+            assert!(
+                !pair.contains(&u32::MAX),
+                "depth fixture exhausted hash capacity"
+            );
+            assert_eq!(
+                pair[0] == pair[1],
+                !cascades,
+                "parallel depth layers: cascades={cascades}"
+            );
+        }
+        assert_eq!(
+            &values[6..9],
+            &[u32::from(!cascades); 3],
+            "opposite faces must not share cascade cache tiles"
+        );
+    }
 }

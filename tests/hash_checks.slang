@@ -1,6 +1,88 @@
 #include "gi.slang"
 [[vk::binding(26, 0)]] RWStructuredBuffer<uint> checks;
 [shader("compute")][numthreads(1,1,1)]
+void read_hash_depth_layer_test() {
+    work[3].store(0u);
+    for(var tile=0u;tile<p.hash_config.w;tile++) {
+        for(var word=0u;word<4u;word++) {hash_tiles[hash_tile_meta(tile)+word].store(0u);}
+    }
+    let directions=float3[3](float3(1,0,0),float3(0,1,0),float3(0,0,1));
+    let origin=float3(0.01);
+    for(var axis=0u;axis<3u;axis++) {
+        work[3].store(0u);
+        for(var tile=0u;tile<p.hash_config.w;tile++) {
+            for(var word=0u;word<4u;word++) {hash_tiles[hash_tile_meta(tile)+word].store(0u);}
+        }
+        let a=hash_tile_insert(origin,directions[axis],1.0);
+        let b=hash_tile_insert(origin+directions[axis]*hash_cell_size(origin),directions[axis],1.0);
+        checks[2u*axis]=a;checks[2u*axis+1u]=b;
+        let n0=hash_tile_descriptor(origin,directions[axis],1.0,directions[axis]);
+        let n1=hash_tile_descriptor(origin,directions[axis],1.0,-directions[axis]);
+        checks[6u+axis]=uint(n0.bucket==n1.bucket&&n0.tag==n1.tag);
+    }
+}
+[shader("compute")][numthreads(1,1,1)]
+void read_sparse_hash_update_test() {
+    let cell=hash_tile_insert(float3(0.01),float3(1,0,0),1.0);
+    let tile=cell/hash_mip_count();let linear=cell%hash_mip_count();
+    let offset=uint2(linear%p.hash_config.z,linear/p.hash_config.z);
+    hash_write(cell,false,float4(2,4,8,2));hash_write(cell,true,float4(0.5,1,2,4));
+    for(var indirect=0u;indirect<2u;indirect++) {
+        let base=hash_scratch_base(tile,offset,indirect!=0u);
+        for(var i=0u;i<4u;i++) {hash_tiles[base+i].store(0u);}
+        let packed=hash_temporal_update(cell,tile,offset,indirect!=0u);
+        let value=hash_unpack(packed);
+        for(var i=0u;i<4u;i++) {checks[4u*indirect+i]=asuint(value[i]);}
+    }
+    hash_write(cell,false,float4(2,4,8,2));
+    hash_tiles[hash_scratch_base(tile,offset,false)+3u].store(1u);
+    let black=hash_unpack(hash_temporal_update(cell,tile,offset,false));
+    for(var i=0u;i<4u;i++) {checks[8u+i]=asuint(black[i]);}
+}
+[shader("compute")][numthreads(1,1,1)]
+void read_empty_directional_cache_test() {
+    let position=float3(0.01);let direction=float3(1,0,0);
+    let cell=hash_tile_insert(position,direction,1.0);
+    let tile=cell/hash_mip_count();
+    for(var mip=0u;mip<4u;mip++) {
+        if(p.hash_config.z>>mip==0u) {break;}
+        let side=p.hash_config.z>>mip;
+        for(var y=0u;y<side;y++) {for(var x=0u;x<side;x++) {
+            let address=hash_cell_index(tile,uint2(x,y),mip);
+            hash_write(address,false,float4(0.0));hash_write(address,true,float4(0.0));
+        }}
+    }
+    var found=false;
+    let empty=directional_cached_radiance(position,direction,1.0,found,true);
+    checks[0]=uint(found);checks[1]=asuint(empty.x);
+    directional_cached_radiance(position,direction,1.0,found);
+    checks[2]=uint(found);
+    // A populated, genuinely black estimate must not trigger fallback.
+    hash_write(cell,false,float4(0,0,0,p.hash_sampling.x));
+    let black=directional_cached_radiance(position,direction,1.0,found,true);
+    checks[3]=uint(found);checks[4]=asuint(black.x);
+    hash_write(cell,false,float4(2,4,8,p.hash_sampling.x));
+    let lit=directional_cached_radiance(position,direction,1.0,found,true);
+    checks[5]=uint(found);
+    for(var channel=0u;channel<3u;channel++) {checks[6u+channel]=asuint(lit[channel]);}
+    let absent=directional_cached_radiance(position+float3(100,200,300),direction,1.0,found,true);
+    checks[9]=uint(found);checks[10]=asuint(absent.x);
+    hash_write(cell,false,float4(0.0));
+    hash_write(cell,true,float4(2,4,8,p.hash_sampling.y));
+    let indirect_only=directional_cached_radiance(position,direction,1.0,found,true);
+    checks[11]=uint(found);
+    for(var channel=0u;channel<3u;channel++) {checks[12u+channel]=asuint(indirect_only[channel]);}
+}
+[shader("compute")][numthreads(1,1,1)]
+void read_source_diffuse_normal_test() {
+    for(var i=0u;i<9u;i++) {probes[0].filtered_sh[i]=probe_pack_sh(float4(0.0));}
+    probes[0].filtered_sh[3]=probe_pack_sh(float4(-1.0,-2.0,-4.0,1.0));
+    let receiver=Surface(float3(0.0),float3(1,0,0),float3(0.5),1.0,0.0,0.5,1.0,true,float3(0,0,1));
+    let interpolation=ProbeInterpolation(uint4(0u,MISSING,MISSING,MISSING),float4(1,0,0,0),1.0);
+    let value=source_diffuse_interpolation(receiver,interpolation);
+    for(var i=0u;i<4u;i++) {checks[i]=asuint(value[i]);}
+}
+[shader("compute")][numthreads(1,1,1)]
 void read_motion_reprojection_test() {
     let position=float3(0.3,-0.2,-3.0);
     let uv=reproject_motion(position,p.sky.xy);

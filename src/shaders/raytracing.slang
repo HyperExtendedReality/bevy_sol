@@ -1,8 +1,8 @@
 [[vk::binding(21, 0)]] RaytracingAccelerationStructure scene_tlas;
-Hit trace_impl(float3 origin, float3 direction, float far, bool any_hit) {
+Hit trace_impl_range(float3 origin, float3 direction, float near, float far, bool any_hit) {
     RayDesc ray;
     ray.Origin = origin; ray.Direction = direction;
-    ray.TMin = p.cache_config.z; ray.TMax = far;
+    ray.TMin = near; ray.TMax = far;
     RayQuery<RAY_FLAG_NONE> query;
     let flags=(any_hit ? RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH : RAY_FLAG_NONE) |
         (source_alpha_testing_disabled() ? RAY_FLAG_FORCE_OPAQUE : RAY_FLAG_NONE);

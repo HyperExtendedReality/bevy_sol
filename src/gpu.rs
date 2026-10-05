@@ -24,6 +24,9 @@ use bevy::{
 use std::{borrow::Cow, num::NonZeroU32};
 const MATERIAL_TEXTURE_CAPACITY: u32 = 64;
 #[cfg(test)]
+#[path = "cascade_tests.rs"]
+mod cascade_tests;
+#[cfg(test)]
 #[path = "environment_tests.rs"]
 mod environment_tests;
 #[cfg(test)]
@@ -41,8 +44,8 @@ fn texture_features() -> WgpuFeatures {
 const CACHE_BYTES: u64 = 224;
 const RAY_BYTES: u64 = 160;
 const WORK_HEADER: u64 = 32;
-const BASE_STAGES: usize = 99;
-const STAGES: [&str; 103] = [
+const BASE_STAGES: usize = 108;
+const STAGES: [&str; 112] = [
     "compute_brdf_lut",
     "reset_work",
     "prepare_primary_geometry_normals",
@@ -86,6 +89,8 @@ const STAGES: [&str; 103] = [
     "prepare_dispatch",
     "prepare_probe_sampling",
     "trace_probes",
+    "prepare_cascade_probes",
+    "trace_cascade_intervals",
     "compact_primary_cells",
     "prepare_dispatch",
     "trace_cache_bounces",
@@ -111,6 +116,13 @@ const STAGES: [&str; 103] = [
     "update_hash_tiles",
     "resolve_hash_bounces",
     "resolve_cache_bounces",
+    "shade_cascade_intervals",
+    "merge_cascade_4",
+    "merge_cascade_3",
+    "merge_cascade_2",
+    "merge_cascade_1",
+    "merge_cascade_0",
+    "resolve_cascade_probes",
     "resolve_probes",
     "filter_probe_radiance_x",
     "filter_probe_radiance_y",
@@ -179,6 +191,14 @@ const SLANG_SOURCES: &[(&str, &str)] = &[
         include_str!("shaders/probe_cache.slang"),
     ),
     ("hash_grid.slang", include_str!("shaders/hash_grid.slang")),
+    (
+        "radiance_cascades.slang",
+        include_str!("shaders/radiance_cascades.slang"),
+    ),
+    (
+        "radiance_cascade_math.slang",
+        include_str!("shaders/radiance_cascade_math.slang"),
+    ),
     ("ggx.slang", include_str!("shaders/ggx.slang")),
     ("light_grid.slang", include_str!("shaders/light_grid.slang")),
     (
@@ -218,6 +238,7 @@ fn compile_shader(
                     "GI_GRID_ENVIRONMENT=1".into(),
                     "GI_SOURCE_RANDOM_BUFFER=2".into(),
                     "GI_PRIMARY_GEOMETRY_NORMALS=1".into(),
+                    "GI_RADIANCE_CASCADES=1".into(),
                 ],
                 ..default()
             },
@@ -251,6 +272,8 @@ struct Params {
     environment: Vec4,
     restir: UVec4,
     restir_sampling: Vec4,
+    cascades: UVec4,
+    cascade_sampling: Vec4,
 }
 #[derive(Clone, Copy, Default, ShaderType)]
 struct CompositeParams {
@@ -486,6 +509,7 @@ struct ViewGi {
     reflections: Buffer,
     light_grid: Buffer,
     restir: Buffer,
+    cascades: Buffer,
     rays: Buffer,
     work: Buffer,
     indirect: Buffer,
@@ -553,7 +577,7 @@ pub(crate) fn install(app: &mut App) {
         );
         return;
     }
-    if limits.max_storage_buffers_per_shader_stage < 13
+    if limits.max_storage_buffers_per_shader_stage < 14
         || limits.max_storage_textures_per_shader_stage < 4
         || limits.max_sampled_textures_per_shader_stage < 12
     {
@@ -569,7 +593,7 @@ pub(crate) fn install(app: &mut App) {
     let mut compute = compile_shader(compiler, "gi.slang", directions, hardware, textured);
     let bindings: Vec<_> = (0..=20)
         .chain(hardware.then_some(21))
-        .chain([24, 25, 27, 28, 29, 30, 31, 32, 33, 34])
+        .chain([24, 25, 27, 28, 29, 30, 31, 32, 33, 34, 35])
         .collect();
     let mappings: Vec<_> = bindings
         .iter()
@@ -732,6 +756,7 @@ fn init_pipelines(
     entries.push(buffer_layout(25, false, 64));
     entries.push(buffer_layout(33, false, 64));
     entries.push(buffer_layout(34, true, 4));
+    entries.push(buffer_layout(35, false, 16));
     entries.push(buffer_layout(27, false, 16384));
     entries.push(buffer_layout(28, false, 96));
     entries.push(buffer_layout(
@@ -1045,11 +1070,12 @@ fn allocate_view(device: &RenderDevice, size: UVec2, settings: &GiSettings) -> O
         c.light_grid.bytes(),
         cached_probes * (16 + probe_bytes(c.probe_directions)),
         (u64::from(probes_count) + 2 * cached_probes) * probe_bytes(c.probe_directions),
-        if c.reservoir_resampling {
+        if c.reservoir_resampling && c.radiance_cascades.is_none() {
             c.world_space_restir.bytes(rays_count)
         } else {
             64
         },
+        c.radiance_cascades.as_ref().map_or(16, |c| c.bytes(tiles)),
     ];
     if size.x == 0
         || size.y == 0
@@ -1058,7 +1084,10 @@ fn allocate_view(device: &RenderDevice, size: UVec2, settings: &GiSettings) -> O
         || sizes
             .iter()
             .any(|&n| n > limits.max_storage_buffer_binding_size || n > limits.max_buffer_size)
-        || limits.max_storage_buffers_per_shader_stage < 13
+        || limits.max_storage_buffers_per_shader_stage < 14
+        || c.radiance_cascades
+            .as_ref()
+            .is_some_and(|c| c.rays(tiles) > u64::from(u32::MAX))
         || limits.max_storage_textures_per_shader_stage < 4
     {
         warn_once!(
@@ -1097,6 +1126,7 @@ fn allocate_view(device: &RenderDevice, size: UVec2, settings: &GiSettings) -> O
         rays: storage(device, "bevy_sol ray work", sizes[1]),
         light_grid: storage(device, "bevy_sol streamed light grid", sizes[6]),
         restir: storage(device, "bevy_sol world-space ReSTIR", sizes[9]),
+        cascades: storage(device, "bevy_sol radiance cascade intervals", sizes[10]),
         work: storage(device, "bevy_sol compact work and dispatch", sizes[3]),
         indirect: storage(device, "bevy_sol indirect dispatch arguments", 112),
         raw_diffuse: Image::new(device, size, TextureFormat::Rgba16Float),
@@ -1396,7 +1426,7 @@ fn prepare_view(
         ),
         quality: Vec4::new(
             c.rough_reflection_threshold,
-            f32::from(c.reservoir_resampling),
+            f32::from(c.reservoir_resampling && c.radiance_cascades.is_none()),
             f32::from(
                 c.temporal_feedback
                     && !c.multibounce
@@ -1490,7 +1520,8 @@ fn prepare_view(
             u32::from(c.probe_projection == crate::ProbeProjection::SourceAtlas)
                 | (u32::from(!c.source_direct_lighting) << 1)
                 | (u32::from(c.source_disable_albedo_textures) << 2)
-                | (u32::from(c.source_disable_alpha_testing) << 3),
+                | (u32::from(c.source_disable_alpha_testing) << 3)
+                | (u32::from(c.radiance_cascades.is_some()) << 4),
         ),
         restir_sampling: state
             .previous_camera
@@ -1505,6 +1536,26 @@ fn prepare_view(
                 .clamp(1e-6, 1.5)
                 .tan()
             }),
+        cascades: c.radiance_cascades.as_ref().map_or(UVec4::ZERO, |cascade| {
+            UVec4::new(
+                cascade.levels,
+                cascade.angular_resolution,
+                cascade.rays(state.tiles) as u32,
+                cascade
+                    .cache_queries(state.tiles, state.probes_count * c.probe_directions.pow(2))
+                    .0,
+            )
+        }),
+        cascade_sampling: c.radiance_cascades.as_ref().map_or(Vec4::ZERO, |cascade| {
+            Vec4::new(
+                cascade.first_interval,
+                cascade
+                    .cache_queries(state.tiles, state.probes_count * c.probe_directions.pow(2))
+                    .1 as f32,
+                0.0,
+                0.0,
+            )
+        }),
     });
     state.params.write_buffer(device, queue);
     let cache_matrix_offset = (WORK_HEADER
@@ -1644,6 +1695,10 @@ fn prepare_view(
         entries.push(BindGroupEntry {
             binding: 34,
             resource: random_buffer.as_entire_binding(),
+        });
+        entries.push(BindGroupEntry {
+            binding: 35,
+            resource: state.cascades.as_entire_binding(),
         });
         device.create_bind_group(
             "bevy_sol compute",
@@ -1833,9 +1888,27 @@ fn dispatch(
             "spawn_probes" => settings.0.probe_projection != crate::ProbeProjection::SourceAtlas,
             "project_probe_atlas" => {
                 settings.0.probe_projection == crate::ProbeProjection::SourceAtlas
+                    && settings.0.radiance_cascades.is_none()
+            }
+            "resolve_probes"
+            | "prepare_probe_sampling"
+            | "trace_probes"
+            | "filter_probe_radiance_x"
+            | "filter_probe_radiance_y"
+            | "filter_probes" => settings.0.radiance_cascades.is_none(),
+            name if name.contains("cascade") => {
+                settings.0.radiance_cascades.as_ref().is_some_and(|c| {
+                    !name.starts_with("merge_cascade_")
+                        || name
+                            .rsplit('_')
+                            .next()
+                            .and_then(|level| level.parse::<u32>().ok())
+                            .is_some_and(|level| level < c.levels)
+                })
             }
             name if name.contains("restir") => {
                 settings.0.reservoir_resampling
+                    && settings.0.radiance_cascades.is_none()
                     && (name != "generate_restir_bounces" || settings.0.multibounce)
             }
             name if name.starts_with("filter_probe_mask_") => {
@@ -1932,6 +2005,25 @@ fn dispatch(
             pass.dispatch_workgroups_indirect(&state.indirect, offset - 16);
         } else {
             let (x, y, z) = match STAGES[index] {
+                "prepare_cascade_probes" => linear(
+                    settings
+                        .0
+                        .radiance_cascades
+                        .as_ref()
+                        .unwrap()
+                        .probes(state.tiles)
+                        .max(u64::from(state.params.get().cascades.w)) as u32,
+                ),
+                "trace_cascade_intervals" | "shade_cascade_intervals" => {
+                    linear(state.params.get().cascades.z)
+                }
+                "resolve_cascade_probes" => linear(state.tiles.x * state.tiles.y),
+                name if name.starts_with("merge_cascade_") => {
+                    let level: u32 = name.rsplit('_').next().unwrap().parse().unwrap();
+                    let config = settings.0.radiance_cascades.as_ref().unwrap();
+                    let dims = config.dimensions(state.tiles, level);
+                    linear(dims.x * dims.y * config.directions(level))
+                }
                 name if name.starts_with("filter_probe_mask_") => {
                     let level: u32 = name.rsplit('_').next().unwrap().parse().unwrap();
                     let dims = (state.tiles >> level).max(UVec2::ONE);

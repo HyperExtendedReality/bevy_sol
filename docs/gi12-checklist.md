@@ -3,6 +3,12 @@
 Reference: Capsaicin `914b91596cd119eda85fbc1d3c7ee6ac391b1452`.
 Status: **1:1 parity is not complete.**
 
+The requested architecture now replaces ReSTIR reuse/probe reconstruction with
+Radiance Cascades while retaining the two cache levels. Track that intentional
+exception and its performance/quality gates in [the cascade checklist](radiance-cascades.md).
+The checked upstream mechanisms below describe the retained reference path;
+ReSTIR, SH projection and legacy probe reconstruction do not run in cascade mode.
+
 `[x]` means implemented with local test coverage, not proven identical to upstream.
 `[ ]` means missing, partial or awaiting parity verification. Checked mechanisms
 still have exact-parity requirements in the remaining-work section.
@@ -19,6 +25,7 @@ See [the detailed inventory](gi12-parity.md) and [validation evidence](validatio
 - [x] Full/quarter/sixteenth probe spawning, Halton phases and edge clamping.
 - [x] Probe reprojection, empty/override compaction and atomic patching.
 - [x] Separate primary geometry and shading normal inputs.
+- [x] Source diffuse SH receiver evaluation uses normalized shading/details normals, with a native regression fixture.
 - [x] Shared MT19937 seed table and source PCG draws.
 - [x] Persistent probe LRU, projected candidate scans/scatter and atlas ownership.
 - [x] Active/fresh probe and visibility/shadow query compaction.
@@ -66,6 +73,7 @@ See [the detailed inventory](gi12-parity.md) and [validation evidence](validatio
 - [ ] Match remaining source texture formats.
 - [ ] Match remaining rounding at each pass boundary.
 - [ ] Match probe sky filtering.
+- [ ] Resolve SourceAtlas physical-energy/probe-resolution bias; optional furnace checks currently fail at both 4x4 and 8x8.
 - [ ] Match source ray distances and offsets.
 - [ ] Match source environment/light sampling endpoints and wave reductions.
 - [ ] Match source previous-depth reconstruction and motion/exposure adapters.

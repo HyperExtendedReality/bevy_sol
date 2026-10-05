@@ -8,6 +8,11 @@ does not establish equivalence or superiority to GI-1.2.
 The [simple checklist](gi12-checklist.md) tracks implemented mechanisms and the
 remaining completion gates, including upstream options and optional inputs.
 
+The default transport now intentionally uses [surface Radiance Cascades](radiance-cascades.md)
+instead of upstream probe reconstruction and ReSTIR reuse. The upstream estimator
+remains selectable with `radiance_cascades: None`; the inventory below records
+that reference path, not a claim that all its stages execute in cascade mode.
+
 | Upstream mechanism | Current executable implementation | Remaining difference |
 |---|---|---|
 | Shader toolchain | Embedded Slang modules compiled by the custom `bevy_slang` crate, native SPIR-V, sparse descriptor relocation, selected specialization compiled once | External `slangc` required; native pipeline currently Vulkan only |
@@ -15,7 +20,7 @@ remaining completion gates, including upstream options and optional inputs.
 | Material evaluation at ray hits | Base/emissive/metallic-roughness maps, UV0/UV1, UV transforms, masks; source sign-corrected cofactor vertex transforms, preserving magnitudes until face-oriented normalized hit interpolation, without material normal maps, single-sided backface rejection or hemisphere repair; compensated normal maps and normalized inverse-transpose vertices | CPU world-space vertex representation replaces source per-instance reconstruction; LOD zero, compensated UV-gradient tangent frames, 64-image capacity; no full layered/transmissive material model |
 | Animated triangle positions | Morphs followed by weighted joint transforms; CPU BVH refit preserves leaf ordering; SourceAtlas retains world/persistent-probe caches across pose-only updates; Bevy transform/skin/morph motion vectors preserve compatible pixel and screen-probe histories during pose refits; compensated mode still clears caches | Synchronous whole-scene extraction/upload; broader animation stability/scaling and upstream moving-scene comparisons unproven |
 | Screen probe allocation and reuse | Full/quarter/sixteenth spawn regions with source shared 256-frame Halton seeds and viewport-edge clamping, whole-tile best-seed reprojection with half-quantized scores, empty/override tile compaction, collision-permitting atomic patch exchanges, separate fresh/active lists and one source atlas probe per tile | Optional second-surface slots remain exclusive to compensated mode |
-| Primary geometry normals | Separate source geometry/shading inputs; one camera-facing triangle query per valid pixel, depth-derived fallback, R10G10B10A2_UNORM cache prepared before probe scheduling; geometry input drives probe history/hemispheres, SH receiver evaluation and interpolation; shading/details normals drive denoising and reflection history | Query/depth matching replaces raster derivatives and adds tracing cost; shading inputs retain Bevy deferred representation |
+| Primary geometry normals | Separate source geometry/shading inputs; one camera-facing triangle query per valid pixel, depth-derived fallback, R10G10B10A2_UNORM cache prepared before probe scheduling; geometry input drives probe history/hemispheres and interpolation gates; normalized shading/details normals drive source diffuse SH receiver evaluation, denoising and reflection history | Query/depth matching replaces raster derivatives and adds tracing cost; shading inputs retain Bevy deferred representation |
 | Random number generation | Renderer-owned shared MT19937 GPU seed table, deterministic seed 5489 by default, componentwise 1920x1080 minimum, retained on shrink and regenerated on growth or source option changes; modulo seed lookup, both MakeRandom overloads and source PCG draws; configurable deterministic/entropy-seeded generation; compact visibility IDs seed multibounce/fresh reservoirs, compact shadow IDs seed temporal resampling | Multiple Bevy GI views request the largest required seed count; no stratified-sampler buffer sharing; entropy uses Rust's OS-seeded hasher rather than std::random_device; atomic append order and frame-equivalent source sequences still need a matched comparison |
 | Persistent probe cache | Source LRU-driven projected candidate counts, exclusive prefix scans and ordinal scatter into contiguous per-tile lists, strict XYZ frustum rejection and normalized tile-grid projection; all scattered neighbors contribute fixed-point radiance reuse; source XYZ/packed snorm10-normal metadata, normalized decoding for ownership and reconnect frames; separate source evicted/updated atlas ownership, source LRU-prefix allocation priority, exclusive claims, old-atlas eviction into MRU and in-place radiance updates that preserve cached metadata/LRU order; compensated mode retains linked lists, shared restoration and scanned free/eviction reservations | Source geometric-normal derivation differs; cache atlas/metadata are flattened into combined records; candidate/claim atomic ordering remains unverified against an upstream frame; compensated SH temporal history remains closest-history |
 | Probe compaction | Active and fresh probe lists with separate GPU indirect counts; dense source first-hit/multibounce visibility streams and valid-reservoir shadow IDs with physical-ray mappings | Fixed-capacity storage; some dispatches use the fresh-ray upper bound and reject unused lanes; source allocates spawn queries separately |
@@ -36,18 +41,30 @@ remaining completion gates, including upstream options and optional inputs.
 
 ## Engine boundary
 
+Source diffuse SH evaluation now uses the normalized shading/details normal,
+while geometry normals continue to govern placement and interpolation gates.
+A native fixture with perpendicular geometry/shading normals failed before
+the correction and passes after it. This follows the pinned upstream
+[InterpolateScreenProbes receiver-normal selection](https://github.com/GPUOpen-LibrariesAndSDKs/Capsaicin/blob/914b91596cd119eda85fbc1d3c7ee6ac391b1452/src/core/src/render_techniques/gi1/gi1.comp#L1440).
+It does not resolve the separate probe-resolution-dependent SourceAtlas furnace
+failures recorded in the cascade benchmark report.
+
 `source_disable_alpha_testing` maps source `DISABLE_ALPHA_TESTING` for GI
 closest-hit and shadow rays. Hardware queries use `RAY_FLAG_FORCE_OPAQUE`;
 software traversal bypasses the alpha predicate. With testing enabled, source
 masked hits use strict alpha greater than 0.5 and reject single-sided masked
 backfaces. Opaque backfaces and all force-opaque hits bypass that rejection.
-An explicit mask-type bit accompanies the UV-channel flags; source classification
+An explicit two-bit alpha type accompanies the UV-channel flags; source classification
 does not infer the material type from the Bevy cutoff. Negative and NaN mask
 cutoffs still denote masked materials and use the source's fixed threshold.
 Compensated mode ignores the disable bit and retains the Bevy material's cutoff
 and inclusive comparison. The switch does not change Bevy's primary raster
-visibility. Blended geometry is still excluded from the extracted GI scene;
-source stochastic blend testing and renderer-wide alpha parity remain open.
+visibility. SourceAtlas now includes `AlphaMode::Blend` in the GI scene and tests
+strict alpha greater than a stochastic threshold for closest and shadow rays.
+Single-sided blended backfaces are rejected when alpha testing is enabled.
+Compensated mode continues to exclude blended geometry. Switching projection
+modes refreshes membership, deformation normal transforms and pixel histories.
+Renderer-wide alpha parity remains open.
 The source blend threshold hashes the interpolated mesh-buffer vertex position
 and frame index, before applying the instance transform. Triangle packets now
 retain three mesh-buffer positions alongside world-space traversal geometry,
@@ -55,8 +72,12 @@ with a 20-word stride. Static and morph-only positions exclude the instance
 transform; skinned positions use the source animation order,
 `instance_inverse * weighted_skin_matrix`, after morphing. CPU extraction/refit
 tests and both native traversal fixtures verify the preserved coordinates and
-their GPU barycentric interpolation. Stochastic blend testing itself remains
-unimplemented.
+their GPU barycentric interpolation. The threshold matches the pinned uint4
+xxHash and upper-24-bit conversion, including conversion of the frame index to
+float before bit-casting. When alpha testing is disabled, blended hit/cone
+emission is multiplied by base-color alpha and its level-zero texture alpha,
+as in `emissiveAlphaScaled`; masks and opaque materials are not dimmed this way.
+Native source-rule comparisons do not establish upstream frame equivalence.
 
 `source_disable_albedo_textures` maps `g_DisableAlbedoTextures` in the pinned
 `gi1.frag` composition: primary diffuse albedo becomes 0.3 and primary specular

@@ -89,7 +89,7 @@ fn slang_variants_preserve_entry_points_storage_strides_and_uniform_offsets() {
                 .unwrap()
                 .0;
             assert_eq!(
-                u64::from(offsets[&(params, 23)]) + 16,
+                u64::from(offsets[&(params, 25)]) + 16,
                 Params::min_size().get()
             );
             assert_eq!(offsets[&(params, 1)], 64); // column-major previous clip matrix
@@ -99,6 +99,8 @@ fn slang_variants_preserve_entry_points_storage_strides_and_uniform_offsets() {
             assert_eq!(offsets[&(params, 21)], 528);
             assert_eq!(offsets[&(params, 22)], 544);
             assert_eq!(offsets[&(params, 23)], 560);
+            assert_eq!(offsets[&(params, 24)], 576);
+            assert_eq!(offsets[&(params, 25)], 592);
         }
     }
     let shader = compile_shader(
