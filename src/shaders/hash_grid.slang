@@ -54,39 +54,32 @@ float hash_cell_size(float3 position) {
     let step = max(length(position - p.camera.xyz) * p.hash_sampling.w, p.cache_config.x);
     return 0.001 * exp2(floor(log2(1000.0 * step)));
 }
-HashTileDesc hash_tile_descriptor(float3 position, float3 direction, float distance,float3 normal=float3(0.0)) {
+HashTileDesc hash_tile_descriptor(float3 position, float3 direction, float distance) {
     let step = max(length(position - p.camera.xyz) * p.hash_sampling.w, p.cache_config.x);
     let level = floor(log2(1000.0 * step));
     let cell_size = 0.001 * exp2(level); let tile_size = cell_size * float(p.hash_config.z);
     let c = asuint(int3(floor(position / tile_size)));
     let d = uint3(floor(float3(0.5) + (direction * 0.5 + float3(0.5)) * 4.0));
     let l = uint(level); let t = uint(distance < tile_size);
-    var bucket = pcg_hash(l + pcg_hash(c.x + pcg_hash(c.y + pcg_hash(c.z + pcg_hash(d.x + pcg_hash(d.y + pcg_hash(d.z + pcg_hash(t)))))))) % p.hash_config.x;
-    var tag = max(1u, xx_hash(l + xx_hash(c.x + xx_hash(c.y + xx_hash(c.z + xx_hash(d.x + xx_hash(d.y + xx_hash(d.z + xx_hash(t)))))))));
+    let bucket = pcg_hash(l + pcg_hash(c.x + pcg_hash(c.y + pcg_hash(c.z + pcg_hash(d.x + pcg_hash(d.y + pcg_hash(d.z + pcg_hash(t)))))))) % p.hash_config.x;
+    let tag = max(1u, xx_hash(l + xx_hash(c.x + xx_hash(c.y + xx_hash(c.z + xx_hash(d.x + xx_hash(d.y + xx_hash(d.z + xx_hash(t)))))))));
     let e = uint3(clamp(floor(position / cell_size) - floor(position / tile_size) * float(p.hash_config.z), float3(0.0), float3(float(p.hash_config.z - 1u))));
-    let a = abs(direction); var offset = e.xy;var axis=2u;var slice=e.z;
-    if (a.x == max(max(a.x, a.y), a.z)) { offset = e.yz;axis=0u;slice=e.x; }
-    else if (a.y == max(max(a.x, a.y), a.z)) { offset = e.xz;axis=1u;slice=e.y; }
-    if(cascades_active()) {
-        // Preserve the dropped coordinate as a sparse depth layer. Otherwise
-        // parallel surfaces inside one tile can share a retained estimate.
-        let n=uint3(floor(0.5+(normal*0.5+0.5)*8.0));
-        let normal_key=select(any(normal!=float3(0.0)),n.x|(n.y<<4u)|(n.z<<8u),0u);
-        let layer=slice+(axis+3u*normal_key)*p.hash_config.z;
-        bucket=pcg_hash(bucket+pcg_hash(layer))%p.hash_config.x;
-        tag=max(1u,xx_hash(tag+xx_hash(layer)));
-    }
+    let a = abs(direction); var offset = e.xy;
+    if (a.x == max(max(a.x, a.y), a.z)) { offset = e.yz; }
+    else if (a.y == max(max(a.x, a.y), a.z)) { offset = e.xz; }
     return HashTileDesc(bucket, tag, offset);
 }
-uint hash_tile_insert(float3 position, float3 direction, float distance,float3 normal=float3(0.0)) {
-    let desc = hash_tile_descriptor(position, direction, distance,normal);
+uint hash_tile_insert(float3 position, float3 direction, float distance) {
+    let desc = hash_tile_descriptor(position, direction, distance);
     for (var offset = 0u; offset < p.hash_config.y; offset++) {
         let tile = desc.bucket * p.hash_config.y + offset; let metadata = hash_tile_meta(tile);
         var existing = hash_tiles[metadata].load();
         // Slang's native compare-exchange is strong and needs no retry loop.
         if (existing == 0u) {
             let claim = hash_tiles[metadata].compareExchange(0u, desc.tag);
-            if (claim == 0u) { hash_tiles[metadata + 2u].store(p.frame.x); existing = desc.tag; }
+            if (claim == 0u) {
+                hash_tiles[metadata + 2u].store(p.frame.x); existing = desc.tag;
+            }
             else { existing = claim; }
         }
         if (existing != desc.tag) { continue; }
@@ -99,8 +92,8 @@ uint hash_tile_insert(float3 position, float3 direction, float distance,float3 n
     }
     return MISSING;
 }
-uint hash_tile_find(float3 position, float3 direction, float distance,float3 normal=float3(0.0)) {
-    let desc = hash_tile_descriptor(position, direction, distance,normal);
+uint hash_tile_find(float3 position, float3 direction, float distance) {
+    let desc = hash_tile_descriptor(position, direction, distance);
     for (var offset = 0u; offset < p.hash_config.y; offset++) {
         let tile = desc.bucket * p.hash_config.y + offset;
         let tag=hash_tiles[hash_tile_meta(tile)].load();
@@ -114,11 +107,6 @@ float4 hash_filtered(uint cell, bool indirect) {
     let tile = cell / hash_mip_count(); let linear = cell % hash_mip_count();
     let offset = uint2(linear % p.hash_config.z, linear / p.hash_config.z);
     var value = hash_read(cell, indirect);
-    // Cascade reconstruction already interpolates spatially. Indirect cache
-    // mips can merge lit and shadowed surfaces across an intervening occluder.
-#if GI_RADIANCE_CASCADES
-    if(p.cascades.x!=0u && indirect) {return value;}
-#endif
     let required = select(indirect, p.hash_sampling.y, p.hash_sampling.x);
     for (var mip = 1u; mip < 4u; mip++) {
         if (p.hash_config.z >> mip == 0u || value.w >= required) { break; }
@@ -134,19 +122,21 @@ float4 hash_radiance(uint cell) {
 void hash_touch(uint cell) {
     hash_tiles[hash_tile_meta(cell / hash_mip_count()) + 1u].store(p.frame.x);
 }
-float3 directional_cached_radiance(float3 position,float3 direction,float distance,out bool found,bool require_samples=false,float3 normal=float3(0.0)) {
-    let cell=hash_tile_find(position,direction,distance,normal);found=cell!=MISSING;
+float3 directional_cached_radiance(float3 position,float3 direction,float distance,out bool found) {
+    let cell=hash_tile_find(position,direction,distance);found=cell!=MISSING;
     if(!found) {return float3(0.0);}
     hash_touch(cell);let value=hash_radiance(cell);
-    if(require_samples) {found=value.w>0.0;}
     return value.rgb;
 }
 void hash_accumulate(uint cell, float3 value, bool indirect) {
     let tile = cell / hash_mip_count(); let linear = cell % hash_mip_count();
     let base = hash_scratch_base(tile, uint2(linear % p.hash_config.z, linear / p.hash_config.z), indirect);
     let quantized = uint3(round(safe_radiance(value) * 1000.0));
-    hash_tiles[base].add(quantized.x); hash_tiles[base + 1u].add(quantized.y);
-    hash_tiles[base + 2u].add(quantized.z); hash_tiles[base + 3u].add(1u);
+    if(any(quantized!=uint3(0u))) {
+        hash_tiles[base].add(quantized.x); hash_tiles[base + 1u].add(quantized.y);
+        hash_tiles[base + 2u].add(quantized.z);
+    }
+    hash_tiles[base + 3u].add(1u);
 }
 [shader("compute")][numthreads(64,1,1)]
 void clear_hash_tiles(uint3 gid : SV_DispatchThreadID) {
@@ -178,12 +168,6 @@ uint2 hash_temporal_update(uint cell, uint tile, uint2 offset, bool indirect) {
     let fresh = float4(float(hash_tiles[base].load()) / 1000.0, float(hash_tiles[base + 1u].load()) / 1000.0,
         float(hash_tiles[base + 2u].load()) / 1000.0, float(hash_tiles[base + 3u].load()));
     let prior = hash_read(cell, indirect);
-    // Bounded cascade queries leave neighboring cells unsampled. No observation
-    // must preserve their estimate; an observed black sample still updates it.
-    if(cascades_active() && fresh.w==0.0) {
-        for(var i=0u;i<4u;i++) {hash_tiles[base+i].store(0u);}
-        return hash_pack(prior);
-    }
     let count = min(prior.w + fresh.w, select(indirect, p.hash_sampling.y, p.hash_sampling.x));
     var value = fresh / max(fresh.w, 1.0);
     if (prior.w > 0.0) { value = lerp(prior / max(prior.w, 1.0), value, 1.0 / max(count, 1.0)); }
@@ -249,7 +233,7 @@ float3 bounce_albedo(float3 position, uint triangle) {
     return clamp(base * (1.0 - 0.16 * reflectance * reflectance), float3(0.0), float3(0.99));
 }
 float4 multibounce_brdf(float3 base, float reflectance, float3 normal, float3 view, float3 direction) {
-    let f0 = float3(0.16 * reflectance * reflectance);
+    let f0 = material_f0(base,0.0,reflectance,p.restir.w);
     let half_vector = normalize(view + direction); let cosine = max(dot(normal, direction), 0.0);
     let value = cosine * (base * diffuse_compensation(f0, dot(half_vector, view)) / PI
         + specular_brdf(normal, view, direction, f0, 1.0));
@@ -267,7 +251,7 @@ float3 directional_direct_radiance(float3 position, float3 n, float3 view, uint 
     // GenerateReservoirs/GenerateMultibounceReservoirs in GI-1.2 force a
     // matte dielectric BRDF before packing the material for PopulateCells.
     let metallic = 0.0; let roughness = 1.0;
-    let f0 = lerp(float3(0.16 * properties.y * properties.y), base, metallic);
+    let f0 = material_f0(base,metallic,properties.y,p.restir.w);
     let origin = offset_origin(position, triangle, n);
     var light = Lighting(float3(0.0), float3(0.0)); var used_reservoir = false;
     if (grid_light_count() > 0u) {
@@ -291,8 +275,7 @@ float3 directional_direct_radiance(float3 position, float3 n, float3 view, uint 
             used_reservoir = true;
             has_reservoir=true;
             let selected = evaluate_light_cone(position,n,info.x,reservoir.xy,4.0*PI/(8.0*12000.0));
-            let shadow_origin = offset_origin(position, triangle, selected.direction);
-            let hit = trace_impl(shadow_origin, selected.direction, max(p.cache_config.z, selected.distance - p.cache_config.z * 2.0), true);
+            let hit = trace_light_shadow(position,n,triangle,selected);
             if (hit.triangle == MISSING) {
                 let half_vector=normalize(view+selected.direction);
                 light.diffuse = selected.value * reservoir.z * diffuse_compensation(f0,dot(half_vector,view));
@@ -341,20 +324,16 @@ void trace_hash_bounces(uint3 gid : SV_DispatchThreadID) {
         direction = normalize(ggx_rotate(float4(-rotation.xyz, rotation.w),
             float3(radius * cos(phi), radius * sin(phi), sqrt(1.0 - uv.x))));
     } else { direction = cosine_ray(ray.normal.xyz, float2(random(rng), random(rng))); }
-    let origin = offset_origin(ray.position.xyz, ray.info.y, direction);
-    let hit = trace(origin, direction, p.cache_config.w); if (hit.triangle == MISSING) { return; }
+    let origin = select(source,offset_ray_position(ray.position.xyz,ray.normal.xyz),offset_origin(ray.position.xyz,ray.info.y,direction));
+    let hit = trace(origin, direction, gi_max_distance()); if (hit.triangle == MISSING) { return; }
     let n = hit_normal(hit, direction); if (all(n == float3(0.0))) { return; }
     let position = origin + direction * hit.distance;
     request_light_location(position);
-    let cell = hash_tile_insert(position, direction, hit.distance,n);
+    let cell = hash_tile_insert(position, direction, hit.distance);
     rays[index].bounce_position = float4(position, hit.distance);
     rays[index].bounce_normal = float4(n, float(distance(ray.position.xyz,position)<hash_cell_size(position)));
     rays[index].bounce_direction = float4(direction, 0.0);
     rays[index].bounce_info = uint4(cell, hit.triangle, 1u, cache_insert(position, n, hit.distance, hit.triangle, false));
-    if(source && cell!=MISSING) {
-        let query=source_append_visibility(index,true);
-        rays[index].bounce_direction.w=asfloat(query);
-    }
     if (source) {
         let triangle = ray.info.y; let bary = barycentrics(ray.position.xyz, triangle);
         let base = geometry[triangle + 13u].rgb * material_texture(uint(geometry[triangle + 11u].x), triangle_uv(triangle, bary, 0u)).rgb;
@@ -388,7 +367,10 @@ void resolve_hash_bounces(uint3 gid : SV_DispatchThreadID) {
     if(source_probe_projection()) {
         value=multibounce_radiance(incoming, float4(unpack2x16float(ray.bounce_info.z), unpack2x16float(ray.bounce_info.w)), p.hash_sampling.z);
         if(ray.bounce_normal.w!=0.0) {rays[index].probe_bounce=float4(value,1.0);}
-    } else {value=bounce_albedo(ray.position.xyz, ray.info.y) * incoming;}
+    } else {
+        value=multibounce_radiance(incoming,float4(bounce_albedo(ray.position.xyz,ray.info.y),1.0),
+            0.0);
+    }
     hash_accumulate(ray.info.w, value, true);
 }
 

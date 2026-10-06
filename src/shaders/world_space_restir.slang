@@ -23,11 +23,18 @@ float3 restir_unpack_normal(uint value) {
     return float3(int3(value<<22u,value<<12u,value<<2u)>>22)/511.0;
 }
 uint restir_pack_material(float3 base) {
+    if(source_specular_materials_disabled(p.restir.w)) {
+        let v=uint3(pow(clamp(base,0.0,1.0),float3(1.0/2.2))*1023.0);
+        return (v.x<<20u)|(v.y<<10u)|v.z;
+    }
     let v=uint3(pow(clamp(base,float3(0.0),float3(1.0)),float3(1.0/2.2))*float3(31.0,63.0,31.0));
     // GenerateReservoirs forces a rough matte dielectric before packing.
     return ((v.x<<11u)|(v.y<<5u)|v.z)<<16u|255u;
 }
 float3 restir_material_base(uint value) {
+    if(source_specular_materials_disabled(p.restir.w)) {
+        return pow(float3((value>>20u)&1023u,(value>>10u)&1023u,value&1023u)/1023.0,float3(2.2));
+    }
     return pow(float3((value>>27u)&31u,(value>>21u)&63u,(value>>16u)&31u)/float3(31.0,63.0,31.0),float3(2.2));
 }
 struct PackedReservoir {
@@ -193,9 +200,15 @@ void compact_restir(uint3 gid:SV_DispatchThreadID) {
 float restir_target(float3 position,float3 normal,float3 view,uint material,PackedReservoir r) {
     if(r.light>=grid_light_count()) {return 0.0;}
     let selected=evaluate_light_cone(position,normal,r.light,r.uv,4.0*PI/(8.0*12000.0));let base=restir_material_base(material);let f0=float3(0.04);
-    let half_vector=normalize(view+selected.direction);let lut=sample_brdf_lut(clamp(dot(normal,view),0.0,1.0),1.0);
+    let half_vector=normalize(view+selected.direction);
+    let diffuse=base*diffuse_compensation(f0,dot(half_vector,view));
+    if(source_specular_materials_disabled(p.restir.w)) {
+        let albedo=luminance(base);
+        return select(albedo>0.0,luminance(selected.value*diffuse)/max(albedo,1e-20),luminance(selected.value));
+    }
+    let lut=sample_brdf_lut(clamp(dot(normal,view),0.0,1.0),1.0);
     let albedo=luminance(base)+luminance(clamp(f0*lut.x+(float3(1.0)-f0)*lut.y,float3(0.0),float3(1.0)));
-    return luminance(selected.value*(base*diffuse_compensation(f0,dot(half_vector,view))+PI*specular_brdf(normal,view,selected.direction,f0,1.0)))/max(albedo,1e-20);
+    return select(albedo>0.0,luminance(selected.value*(diffuse+PI*specular_brdf(normal,view,selected.direction,f0,1.0)))/max(albedo,1e-20),luminance(selected.value));
 }
 void restir_merge(inout PackedReservoir result,inout float target,PackedReservoir candidate,float candidate_target,inout uint rng) {
     let sum_count=max(result.count+candidate.count,1e-30);

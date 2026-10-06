@@ -1,5 +1,14 @@
 #include "gi.slang"
 [[vk::binding(26,0)]] RWStructuredBuffer<uint> restir_checks;
+[shader("compute")][numthreads(1,1,1)]
+void read_diffuse_only_target() {
+    let view=normalize(float3(1,0,1));
+    var reservoir=PackedReservoir(0u,float2(0.2,0.7),1.0,1.0,1.0);
+    restir_checks[0]=asuint(restir_target(float3(0,0,-1),float3(0,0,1),view,restir_pack_material(float3(0.25,0.5,0.75)),reservoir));
+    restir_checks[1]=asuint(restir_target(float3(0,0,-1),float3(0,0,1),view,restir_pack_material(float3(0.0)),reservoir));
+    reservoir.light=MISSING;
+    restir_checks[2]=asuint(restir_target(float3(0,0,-1),float3(0,0,1),view,0u,reservoir));
+}
 [shader("compute")][numthreads(64,1,1)]
 void seed_restir_scan(uint3 gid:SV_DispatchThreadID) {
     let index=gid.x;if(index>=restir_entries()) {return;}
@@ -36,7 +45,7 @@ void read_restir_lookup(uint3 gid:SV_DispatchThreadID) {
 [shader("compute")][numthreads(1,1,1)]
 void seed_restir_resample() {
     let world=float3(0.0,0.0,-1.0);let normal=float3(0,0,1);var rng=pcg_hash(p.frame.x+1u);
-    let mode=p.restir.w;let previous_normal=select(mode==1u,-normal,normal);
+    let mode=asuint(p.sky.w);let previous_normal=select(mode==1u,-normal,normal);
     restir[restir_normals(false)+127u].store(restir_pack_normal(previous_normal));
     restir_store_reservoir(127u,PackedReservoir(0u,float2(0.2,0.7),select(mode==2u,0.0,4.0),80.0,1.0));
     restir_insert(127u,restir_jitter(world,normal,rng));

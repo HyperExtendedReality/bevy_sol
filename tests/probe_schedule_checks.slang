@@ -320,7 +320,7 @@ void read_source_interpolation() {
     let rejected=source_directional_interpolation(interpolation,s.normal);
     for(var i=0u;i<4u;i++) {checks[541u+i]=asuint(rejected[i]);}
     interpolation=probe_interpolation_weights(s,uint4(MISSING),0.1);
-    let missing_diffuse=source_diffuse_interpolation(s,interpolation);
+    let missing_diffuse=source_diffuse_interpolation(interpolation,surface_shading_normal(s),1.0,float3(0.0));
     let missing_directional=source_directional_interpolation(interpolation,s.normal);
     for(var i=0u;i<4u;i++) {checks[545u+i]=asuint(missing_diffuse[i]);checks[549u+i]=asuint(missing_directional[i]);}
     let receiver=Surface(float3(0,0,-2),s.normal,s.base,s.roughness,s.metallic,s.reflectance,s.ao,true,s.geometry_normal);

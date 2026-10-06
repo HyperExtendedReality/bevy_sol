@@ -35,6 +35,7 @@ fn slang_variants_preserve_entry_points_storage_strides_and_uniform_offsets() {
             let mut arrays = HashMap::new();
             let mut strides = HashMap::new();
             let mut offsets = HashMap::new();
+            let mut bindings = HashMap::new();
             let mut entries = Vec::new();
             let mut cursor = 5;
             while cursor < words.len() {
@@ -52,6 +53,9 @@ fn slang_variants_preserve_entry_points_storage_strides_and_uniform_offsets() {
                     71 if operands[1] == 6 => {
                         strides.insert(operands[0], operands[2]);
                     }
+                    71 if operands[1] == 33 => {
+                        bindings.insert(operands[0], operands[2]);
+                    }
                     72 if operands[2] == 35 => {
                         offsets.insert((operands[0], operands[1]), operands[3]);
                     }
@@ -61,6 +65,16 @@ fn slang_variants_preserve_entry_points_storage_strides_and_uniform_offsets() {
             }
             for entry in STAGES {
                 assert!(entries.iter().any(|name| name == entry), "missing {entry}");
+            }
+            for (name, binding) in [
+                ("occlusion_and_bent_normal", 35),
+                ("near_field_irradiance", 36),
+            ] {
+                let id = names.iter().find(|(_, n)| n.as_str() == name).unwrap().0;
+                assert_eq!(
+                    bindings[id], binding,
+                    "optional reconstruction attachment {name}"
+                );
             }
             for (name, bytes) in [
                 ("Probe", probe_bytes(directions)),
@@ -89,7 +103,7 @@ fn slang_variants_preserve_entry_points_storage_strides_and_uniform_offsets() {
                 .unwrap()
                 .0;
             assert_eq!(
-                u64::from(offsets[&(params, 25)]) + 16,
+                u64::from(offsets[&(params, 23)]) + 16,
                 Params::min_size().get()
             );
             assert_eq!(offsets[&(params, 1)], 64); // column-major previous clip matrix
@@ -99,8 +113,6 @@ fn slang_variants_preserve_entry_points_storage_strides_and_uniform_offsets() {
             assert_eq!(offsets[&(params, 21)], 528);
             assert_eq!(offsets[&(params, 22)], 544);
             assert_eq!(offsets[&(params, 23)], 560);
-            assert_eq!(offsets[&(params, 24)], 576);
-            assert_eq!(offsets[&(params, 25)], 592);
         }
     }
     let shader = compile_shader(

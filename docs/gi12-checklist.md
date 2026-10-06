@@ -3,11 +3,10 @@
 Reference: Capsaicin `914b91596cd119eda85fbc1d3c7ee6ac391b1452`.
 Status: **1:1 parity is not complete.**
 
-The requested architecture now replaces ReSTIR reuse/probe reconstruction with
-Radiance Cascades while retaining the two cache levels. Track that intentional
-exception and its performance/quality gates in [the cascade checklist](radiance-cascades.md).
-The checked upstream mechanisms below describe the retained reference path;
-ReSTIR, SH projection and legacy probe reconstruction do not run in cascade mode.
+The sole target is a 1:1 port of GI-1.2: screen probes, persistent radiance
+caches, reservoir importance sampling and optional world-space ReSTIR-style
+resampling, source probe reconstruction, and reflections. Resampling improves
+lighting samples gathered at probe/cache hits; probe transport stays intact.
 
 `[x]` means implemented with local test coverage, not proven identical to upstream.
 `[ ]` means missing, partial or awaiting parity verification. Checked mechanisms
@@ -26,12 +25,16 @@ See [the detailed inventory](gi12-parity.md) and [validation evidence](validatio
 - [x] Probe reprojection, empty/override compaction and atomic patching.
 - [x] Separate primary geometry and shading normal inputs.
 - [x] Source diffuse SH receiver evaluation uses normalized shading/details normals, with a native regression fixture.
+- [x] Optional packed AO/bent-normal and near-field irradiance camera attachments, source SH cone evaluation and irradiance units through denoising.
 - [x] Shared MT19937 seed table and source PCG draws.
 - [x] Persistent probe LRU, projected candidate scans/scatter and atlas ownership.
 - [x] Active/fresh probe and visibility/shadow query compaction.
 - [x] Equal-area probe importance sampling and shared CDF construction.
 - [x] Fixed-point radiance reuse, hysteresis, mask mips and directional filtering.
+- [x] Source sky/zero-distance probe filtering, distinct resident/reprojected hemisphere predicates, unclamped fixed-point conversion and half-packed spawn radiance before blending.
+- [x] Source ULP/additive position offsets, zero ray TMin, 1e9 GI range and unnormalized point-shadow segments with 1/16384 endpoint exclusion.
 - [x] Signed half-packed SH projection and four-probe interpolation.
+- [x] Raw source probe radiance/SH half packing and stored half sample directions decoded without renormalization; packed shared spawn radiance before blending.
 - [x] Cubemap evaluation, source environment RIS/ReSTIR and importance PDFs.
 - [x] Tiled hash-grid descriptors, atomic accumulation, mips, caps and decay.
 - [x] Streamed light-grid bounds, reservoir builders and merge policies.
@@ -40,6 +43,9 @@ See [the detailed inventory](gi12-parity.md) and [validation evidence](validatio
 - [x] Probe and glossy temporal radiance feedback with distinct rejection rules.
 - [x] Source direct-lighting option for sky/emissive injection and probe feedback.
 - [x] Source albedo-texture disable option: primary diffuse albedo 0.3 and specular F0 zero.
+- [x] Source specular-material disable option: diffuse probe sampling, RGB10 reservoir materials, secondary diffuse compensation and GI reflection suppression.
+- [x] Source dielectric F0 0.04 in probe sampling, hit shading, reservoir targets, multibounce and primary GI composition.
+- [x] Source GGX squared-alpha clamp, unclamped bounded-cap alpha, signed visibility cosines and singular PDF endpoint.
 - [x] Source GI alpha-disable switch, explicit mask types, strict threshold and masked sidedness.
 - [x] GGX reflection sampling, source blue-noise tables and BRDF LUT.
 - [x] Half/full reflection modes with independent radii and firefly thresholds.
@@ -59,12 +65,8 @@ See [the detailed inventory](gi12-parity.md) and [validation evidence](validatio
 - [ ] Match per-instance geometry reconstruction, acceleration structures and GPU deformation.
 - [ ] Match source raster geometry/shading normals, visibility and material attachments.
 - [ ] Match source material evaluation and texture LOD/gradient behavior.
-- [ ] Map specular-material override.
 - [ ] Match source stochastic alpha blending, including disabled-alpha emissive scaling.
 - [ ] Match renderer-wide primary visibility and alpha behavior.
-- [ ] Map optional occlusion input.
-- [ ] Map optional bent-normal input.
-- [ ] Map optional near-field GI input.
 - [ ] Map source probe, hash-cache and reflection debug views.
 - [ ] Map source cache statistics options.
 - [ ] Match shared RNG ownership and entropy options; compare actual frame sequences.
@@ -72,10 +74,9 @@ See [the detailed inventory](gi12-parity.md) and [validation evidence](validatio
 - [ ] Verify candidate claims, append ordering and cache contention against source frames.
 - [ ] Match remaining source texture formats.
 - [ ] Match remaining rounding at each pass boundary.
-- [ ] Match probe sky filtering.
 - [ ] Resolve SourceAtlas physical-energy/probe-resolution bias; optional furnace checks currently fail at both 4x4 and 8x8.
-- [ ] Match source ray distances and offsets.
 - [ ] Match source environment/light sampling endpoints and wave reductions.
+- [ ] Match the source normalized exclusive probe CDF, full-precision reuse weights and per-cell reuse-count sampling gate.
 - [ ] Match source previous-depth reconstruction and motion/exposure adapters.
 - [ ] Match reflection boundary taps, cleanup update behavior and remaining thresholds.
 - [ ] Build a harness with identical scene, material, camera and sampling inputs.

@@ -61,7 +61,7 @@ void reproject_gi(uint3 gid : SV_DispatchThreadID) {
     var specular=float4(0.0);
     if (p.options.w!=0u) {
         let albedo=reflection_directional_albedo(s);
-        if (s.roughness>p.reflection_filter.w) {specular=float4(lighting.rgb/max(lighting.w,1.0)*albedo,1.0);}
+        if (s.roughness>p.reflection_filter.w) {specular=float4(lighting.rgb/max(lighting.w,1.0)*diffuse_irradiance_scale()*albedo,1.0);}
         else {let reflection=reflection_load_full(2u,pixel);specular=float4(reflection.rgb/max(reflection.w,1.0)*albedo,reflection.w);}
     }
     output_diffuse[coord]=lighting;output_specular[coord]=specular;
@@ -90,7 +90,7 @@ void filter_gi(uint2 pixel,int2 direction) {
     }
     var specular=raw_specular.Load(int3(coord,0));
     if (s.valid && direction.y>0 && p.options.w!=0u && s.roughness>p.reflection_filter.w) {
-        specular=float4(lighting.rgb/max(lighting.w,1.0)*reflection_directional_albedo(s),1.0);
+        specular=float4(lighting.rgb/max(lighting.w,1.0)*diffuse_irradiance_scale()*reflection_directional_albedo(s),1.0);
     }
     output_diffuse[coord]=lighting;output_specular[coord]=specular;
 }

@@ -1,12 +1,11 @@
 #![recursion_limit = "256"]
-//! GI-1.2-inspired hybrid lighting for Bevy 0.19.1.
+//! AMD Capsaicin GI-1.2 port for Bevy 0.19.1; exact parity remains in progress.
 //! Rust manages screen probes, a world radiance cache, and reconstructed reflections.
 //! Slang/SPIR-V uses hardware ray queries or a software BVH; Bevy retains direct lighting.
 mod environment;
 mod gpu;
 mod hash_grid;
 mod light_grid;
-mod radiance_cascades;
 mod random;
 mod raytracing;
 mod reflections;
@@ -25,7 +24,6 @@ use bevy::{
 pub use environment::{EnvironmentSampling, GiEnvironmentMap};
 pub use hash_grid::HashGridCacheConfig;
 pub use light_grid::{LightGridConfig, LightGridMerge};
-pub use radiance_cascades::RadianceCascadesConfig;
 pub use random::RandomConfig;
 pub use reflections::{ReflectionConfig, ReflectionDenoiser};
 pub use restir::WorldSpaceRestirConfig;
@@ -64,6 +62,19 @@ pub enum ProbeProjection {
 #[derive(Component)]
 pub struct GiExclude;
 
+/// Optional GI-1.2 reconstruction attachments for a camera using SourceAtlas.
+/// Images use full render-target pixel coordinates, including viewport offsets.
+/// Attachments must be single-sampled linear float-sampled 2D images at mip zero.
+#[derive(Component, Clone, Debug, ExtractComponent)]
+pub struct GiReconstructionInputs {
+    /// World-space bent normal encoded as 0.5 * normal + 0.5 in RGB; AO in alpha.
+    /// AO 0 closes the irradiance cone; AO 1 admits the full hemisphere.
+    pub occlusion_and_bent_normal: Handle<Image>,
+    /// Scene-linear irradiance added before diffuse reconstruction and denoising.
+    /// None supplies zero near-field irradiance.
+    pub near_field_irradiance: Option<Handle<Image>>,
+}
+
 /// Traversal backend. Hardware requires `WgpuFeatures::EXPERIMENTAL_RAY_QUERY`
 /// in the application's `WgpuSettings` before the renderer initializes.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -100,9 +111,6 @@ impl Default for HybridGi {
 /// Configure allocation and sampling before adding the plugin.
 #[derive(Clone, Debug)]
 pub struct HybridGiConfig {
-    /// Default transport reconstruction. None selects the legacy GI-1.2 reference.
-    /// ReSTIR dispatches and allocations are disabled whenever cascades are enabled.
-    pub radiance_cascades: Option<RadianceCascadesConfig>,
     pub probe_projection: ProbeProjection,
     pub random: RandomConfig,
     /// Slang compiler invoked once during shader initialization. Uses SLANGC/PATH by default.
@@ -128,9 +136,11 @@ pub struct HybridGiConfig {
     pub cell_size_scale: f32,
     /// Unused entries expire after this many rendered GI frames.
     pub cache_lifetime: u32,
-    /// Rays beyond this distance return the environment radiance.
+    /// Compensated estimator ray limit. SourceAtlas uses GI-1.2's fixed 1e9 limit.
     pub max_ray_distance: f32,
-    /// Surface offset and minimum intersection distance, in world units.
+    /// Compensated estimator surface offset and minimum intersection distance;
+    /// also used for engine geometry matching tolerances.
+    /// SourceAtlas uses the source integer position offset and zero minimum.
     pub ray_bias: f32,
     /// Constant scene-linear radiance added to `GiEnvironmentMap` in all directions.
     pub sky_radiance: Vec3,
@@ -142,13 +152,16 @@ pub struct HybridGiConfig {
     /// Source final-composition override: diffuse albedo 0.3 and specular F0 zero.
     /// Secondary material evaluation is unchanged. Ignored in compensated mode.
     pub source_disable_albedo_textures: bool,
+    /// GI-1.2 diffuse-only materials, including reservoir targets and multibounce.
+    /// Disables GI reflections and ignores metallicity. SourceAtlas only.
+    pub source_disable_specular_materials: bool,
     /// Force opaque GI closest-hit and shadow traversal in SourceAtlas.
     /// Blend emission is scaled by base alpha when disabled; otherwise hits are stochastic.
     /// Bevy's primary raster alpha testing is unchanged. Ignored in compensated mode.
     pub source_disable_alpha_testing: bool,
     /// 1..=8 weighted next-event samples per receiver pixel and uncached shading.
     pub direct_samples: u32,
-    /// Reference-mode only: temporal/spatial reuse of streamed-grid light reservoirs.
+    /// Temporal/spatial reuse of streamed-grid light reservoirs.
     /// Fresh eight-candidate RIS is always used. Default false, as in GI-1.2.
     /// Compensated probe projection and uncached shading retain next-event sampling.
     pub reservoir_resampling: bool,
@@ -171,7 +184,6 @@ pub struct HybridGiConfig {
 impl Default for HybridGiConfig {
     fn default() -> Self {
         Self {
-            radiance_cascades: Some(RadianceCascadesConfig::default()),
             probe_projection: ProbeProjection::default(),
             random: RandomConfig::default(),
             slang_compiler: bevy_slang::SlangCompiler::default(),
@@ -194,6 +206,7 @@ impl Default for HybridGiConfig {
             multibounce: true,
             source_direct_lighting: true,
             source_disable_albedo_textures: false,
+            source_disable_specular_materials: false,
             source_disable_alpha_testing: false,
             direct_samples: 4,
             reservoir_resampling: false,
@@ -209,9 +222,6 @@ impl Default for HybridGiConfig {
 }
 impl HybridGiConfig {
     pub fn validate(&self) -> Result<(), &'static str> {
-        if let Some(cascades) = &self.radiance_cascades {
-            cascades.validate(self.max_ray_distance)?;
-        }
         self.hash_grid.validate()?;
         self.reflection.validate(self.rough_reflection_threshold)?;
         self.light_grid.validate()?;
@@ -273,6 +283,7 @@ impl Plugin for HybridGiPlugin {
                 ExtractResourcePlugin::<GiEnvironmentMap>::default(),
                 ExtractResourcePlugin::<environment::EnvironmentRevision>::default(),
                 ExtractComponentPlugin::<HybridGi>::default(),
+                ExtractComponentPlugin::<GiReconstructionInputs>::default(),
             ))
             .add_systems(
                 PostUpdate,

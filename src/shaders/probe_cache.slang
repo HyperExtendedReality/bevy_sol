@@ -286,8 +286,8 @@ void source_cached_probe_ownership(uint index) {
         for(var bin=0u;bin<PROBE_DIRECTIONS;bin++) {
             let value=probe_unpack(old.samples[bin]);
             let direction=hemisphere_ray(old.normal.xyz,bin_uv(bin,float2(0.5)));
-            let endpoint=old.position.xyz+direction*min(value.w,p.cache_config.w);
-            if(value.w>0.0 && dot(normal,endpoint-position)>0.0) {evict=false;break;}
+            let offset=old.position.xyz+direction*value.w-position;
+            if(probe_reuse_hemisphere_allowed(dot(normal,normalize(offset)),true)) {evict=false;break;}
         }
     }
     var updated=MISSING;var evicted=MISSING;var updated_score=cell_size;var evicted_score=cell_size;

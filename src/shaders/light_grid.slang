@@ -248,9 +248,13 @@ float grid_target_cone(float3 position,float3 normal,float3 view,uint triangle,u
     let sample=evaluate_light_cone(position,normal,light,uv,solid_angle);
     if (triangle==MISSING || all(sample.value==float3(0.0))) {return luminance(sample.value);}
     let base=geometry[triangle+13u].rgb*material_texture(uint(geometry[triangle+11u].x),triangle_uv(triangle,barycentrics(position,triangle),0u)).rgb;
-    let reflectance=geometry[triangle+12u].y;let f0=float3(0.16*reflectance*reflectance);
+    let f0=material_f0(base,0.0,geometry[triangle+12u].y,p.restir.w);
     let half_vector=normalize(view+sample.direction);
     let diffuse=base*diffuse_compensation(f0,dot(half_vector,view));
+    if(source_specular_materials_disabled(p.restir.w)) {
+        let albedo=luminance(base);
+        return select(albedo>0.0,luminance(sample.value*diffuse)/max(albedo,1e-20),luminance(sample.value));
+    }
     let specular=specular_brdf(normal,view,sample.direction,f0,1.0);
     let lut=sample_brdf_lut(clamp(dot(normal,view),0.0,1.0),1.0);
     let albedo=luminance(base)+luminance(clamp(f0*lut.x+(float3(1.0)-f0)*lut.y,float3(0.0),float3(1.0)));

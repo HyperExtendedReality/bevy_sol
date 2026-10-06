@@ -32,10 +32,14 @@ float ggx_bounded_pdf(float alpha, float alpha_squared, float nh, float3 view) {
     let d = ggx_ndf(alpha_squared, nh);
     if (view.z >= 0.0) {
         let s = 1.0 + sign(1.0 - alpha) * length(view.xy);
-        let k = (1.0 - alpha_squared) * s * s / (s * s + alpha_squared * view.z * view.z);
-        return d / max(2.0 * (k * view.z + t), 1e-20);
+        // The bounded cap uses alpha squared before the material's NDF clamp.
+        let a2=alpha*alpha;
+        let k = (1.0 - a2) * s * s / (s * s + a2 * view.z * view.z);
+        let denominator=2.0*(k*view.z+t);
+        return d/select(source_probe_projection(),denominator,max(denominator,1e-20));
     }
-    return d * (t - view.z) / max(2.0 * length_squared, 1e-20);
+    let denominator=2.0*length_squared;
+    return d*(t-view.z)/select(source_probe_projection(),denominator,max(denominator,1e-20));
 }
 float ggx_visibility_reciprocal(float alpha_squared, float nl, float nv) {
     let r = 1.0 - alpha_squared;
@@ -44,13 +48,14 @@ float ggx_visibility_reciprocal(float alpha_squared, float nl, float nv) {
 }
 float3 ggx_sample_weight(float alpha, float3 view, float3 light, float3 f0) {
     if (light.z <= 0.0) { return float3(0.0); }
-    let h = normalize(view + light); let a2 = alpha * alpha;
+    let h = normalize(view + light); let a2 = select(source_probe_projection(),max(alpha*alpha,1e-6),alpha*alpha);
     let fresnel = f0 + (float3(1.0) - f0) * pow(1.0 - clamp(abs(dot(h, view)), 0.0, 1.0), 5.0);
     let pdf = ggx_bounded_pdf(alpha, a2, clamp(h.z, -1.0, 1.0), view);
     return fresnel * ggx_ndf(a2, h.z) * light.z
         / max(ggx_visibility_reciprocal(a2, light.z, view.z) * pdf, 1e-20);
 }
 float3 diffuse_compensation(float3 f0, float dot_hv) {
+    if(source_specular_materials_disabled(p.restir.w)) {f0=float3(0.04);}
     let grazing=pow(1.0-clamp(abs(dot_hv),0.0,1.0),5.0);
     let fresnel=f0+(float3(1.0)-f0)*grazing;
     return (float3(1.0)-fresnel)*1.05*(1.0-grazing);
@@ -61,6 +66,7 @@ float3 ggx_specular_direction(float3 normal,float3 view,float roughness) {
     return normalize(lerp(normal,reflect(-view,normal),factor));
 }
 float brdf_specular_probability(float3 f0,float dot_hv,float3 albedo) {
+    if(source_specular_materials_disabled(p.restir.w)) {return 0.0;}
     let fresnel=f0+(float3(1.0)-f0)*pow(1.0-clamp(abs(dot_hv),0.0,1.0),5.0);
     let specular=luminance(fresnel);
     let diffuse=luminance(albedo*diffuse_compensation(f0,dot_hv));

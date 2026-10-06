@@ -4,18 +4,23 @@
 // The two packed arrays occupy the former float4 array's storage stride.
 static const float PROBE_ANGLE_THRESHOLD = 0.9980267284; // cos(0.02 * pi)
 uint2 probe_pack(float4 value) {
-    // Positive infinity is the source's half-packed far-hit sentinel.
-    // Keep it in distance, while preventing bad radiance from poisoning the CDF.
-    value.rgb=safe_radiance(value.rgb);value.w=select(value.w==value.w,value.w,-1.0);
+    // ScreenProbes_PackRadiance is raw packHalf4, including signed/nonfinite values.
+    if(!source_probe_projection()) {
+        value.rgb=safe_radiance(value.rgb);value.w=select(value.w==value.w,value.w,-1.0);
+    }
     return uint2(pack2x16float(value.xy),pack2x16float(value.zw));
 }
 float4 probe_unpack(uint2 value) {return float4(unpack2x16float(value.x),unpack2x16float(value.y));}
 uint2 probe_pack_sh(float4 value) {
     // SH coefficients are signed. They must never pass through the nonnegative
     // radiance sanitizer. Pack across storage to preserve half quantization.
-    value=select(value==value,clamp(value,float4(-60000.0),float4(60000.0)),float4(0.0));
+    if(!source_probe_projection()) {
+        value=select(value==value,clamp(value,float4(-60000.0),float4(60000.0)),float4(0.0));
+    }
     return uint2(pack2x16float(value.xy),pack2x16float(value.zw));
 }
+uint2 probe_pack_sample(float3 direction) {return uint2(pack2x16float(direction.xy),pack2x16float(float2(direction.z,0.0)));}
+float3 probe_unpack_sample(uint2 packed) {return float3(unpack2x16float(packed.x),unpack2x16float(packed.y).x);}
 float3 probe_shadow_preserving_blend(float3 current,float3 previous) {
     // BlendScreenProbes: darkening responds immediately; large brightening
     // retains history with the source squared, capped luminance hysteresis.
@@ -27,6 +32,7 @@ float3 probe_empty_cell_backup(float3 total,uint populated,uint directions) {
     return total/(float(max(populated,1u))*float(max(directions-populated,1u)));
 }
 uint4 probe_quantize(float4 value) {
+    if(source_probe_projection()) {return uint4(round(value*10000.0));}
     // ScreenProbes_QuantizeRadiance uses integer sums at a scale of 10000.
     // Bound far endpoints before conversion, where half storage uses infinity.
     value.rgb=safe_radiance(value.rgb);value.w=clamp(value.w,0.0,min(p.cache_config.w,429496.0));
@@ -102,8 +108,20 @@ void probe_reuse_add(uint index,float4 value) {
     for(var channel=0u;channel<4u;channel++) {InterlockedAdd(probe_reuse_values[4u*index+channel],quantized[channel]);}
     InterlockedAdd(probe_reuse_counts[index],1u);
 }
+bool probe_reuse_hemisphere_allowed(float cosine,bool resident) {return resident ? !(cosine<0.0) : cosine>0.0;}
 void probe_reuse_reconnect(uint base,uint bin,float3 position,float3 normal,
-    float3 old_position,float3 old_normal,uint2 packed) {
+    float3 old_position,float3 old_normal,uint2 packed,bool resident=false) {
+    if(source_probe_projection()) {
+        let value=probe_unpack(packed);
+        let direction=hemisphere_ray(old_normal,bin_uv(bin,float2(0.5)));
+        let offset=old_position+direction*value.w-position;let distance=length(offset);
+        let reconnected=offset/distance;
+        // ReprojectScreenProbes and cached reuse require a positive dot product.
+        // SampleScreenProbes' resident-neighbor branch rejects only negative dots.
+        let cosine=dot(normal,reconnected);
+        if(probe_reuse_hemisphere_allowed(cosine,resident)) {probe_reuse_add(base+direction_bin(normal,reconnected),float4(value.rgb,distance));}
+        return;
+    }
     var value=probe_unpack(packed);if(value.w<=0.0) {return;}
     let old_direction=hemisphere_ray(old_normal,bin_uv(bin,float2(0.5)));var direction=old_direction;
     if(value.w<p.cache_config.w*0.99) {
@@ -135,7 +153,7 @@ void reproject_probe_history(uint3 gid:SV_DispatchThreadID,uint local:SV_GroupIn
     }
     let count=probe_reuse_counts[local];
     var value=probe_recover(uint4(probe_reuse_values[4u*local],probe_reuse_values[4u*local+1u],probe_reuse_values[4u*local+2u],probe_reuse_values[4u*local+3u]))/float(max(count,1u));
-    if(count==0u) {value=float4(probe_empty_cell_backup(sum,populated,PROBE_DIRECTIONS),p.cache_config.w);}
+    if(count==0u) {value=float4(probe_empty_cell_backup(sum,populated,PROBE_DIRECTIONS),gi_max_distance());}
     if(probes[index].position.w==0.0) {value=float4(0,0,0,-1);}
     probes[index].samples[bin]=probe_pack(value);probes[index].filtered_samples[bin]=probe_pack(value);
 }
@@ -170,7 +188,7 @@ void prepare_probe_sampling(uint3 gid : SV_DispatchThreadID,uint local : SV_Grou
             if(source_probe_projection()) {
                 let resident=previous_probes[probe_reprojected_history()+uint(tap.x)+uint(tap.y)*p.screen.x];
                 if(resident.position.w!=0.0 && abs(dot(resident.position.xyz-position,normal))<=cell_size) {
-                    probe_reuse_reconnect(base,bin,position,normal,resident.position.xyz,resident.normal.xyz,resident.samples[bin]);
+                    probe_reuse_reconnect(base,bin,position,normal,resident.position.xyz,resident.normal.xyz,resident.samples[bin],true);
                 }
             }
             let tile_index=uint(tap.x)+uint(tap.y)*p.screen.x;
@@ -234,14 +252,16 @@ float4 probe_sample_direction(uint index,uint bin,Surface s,inout uint rng) {
     let local_view=mul(transpose(frame),view);
     let dominant=ggx_specular_direction(surface_shading_normal(s),view,s.roughness);
     let half_vector=normalize(view+dominant);
-    let f0=lerp(float3(0.16*s.reflectance*s.reflectance),s.base,s.metallic);
+    let f0=material_f0(s.base,s.metallic,s.reflectance,p.restir.w);
     let probability=select(local_view.z>0.0,
         brdf_specular_probability(f0,dot(half_vector,view),s.base*(1.0-s.metallic)),0.0);
     if(source_probe_projection()) {
         let rotation=ggx_rotation_to_z(frame_normal);let source_view=ggx_rotate(rotation,view);
         let samples=float2(grid_random(rng),grid_random(rng));
         var direction=float3(0.0);
-        if(grid_random(rng)<probability) {
+        var sample_specular=false;
+        if(!source_specular_materials_disabled(p.restir.w)) {sample_specular=grid_random(rng)<probability;}
+        if(sample_specular) {
             let h=ggx_bounded_normal(max(s.roughness*s.roughness,1e-6),source_view,samples);
             direction=normalize(ggx_rotate(float4(-rotation.xyz,rotation.w),reflect(-source_view,h)));
         } else {
@@ -331,12 +351,13 @@ void filter_probe_radiance(uint3 gid,bool horizontal) {
                 dot(direction,neighbor_normal.xyz)<0.0) {continue;}
             let neighbor_bin=direction_bin(neighbor_normal.xyz,direction);
             let value=probe_filter_read(neighbor_index,neighbor_bin,horizontal);
-            if(value.w<=0.0||distance<=0.0) {continue;}
+            if(!source_probe_projection() && (value.w<=0.0||distance<=0.0)) {continue;}
             let hit_distance=min(value.w,distance);
-            let neighbor_direction=hemisphere_ray(neighbor_normal.xyz,bin_uv(neighbor_bin,float2(0.5)));
+            var neighbor_direction=hemisphere_ray(neighbor_normal.xyz,bin_uv(neighbor_bin,float2(0.5)));
+            if(source_probe_projection()) {neighbor_direction=normalize(neighbor_direction);}
             let hit_point=neighbor_position.xyz+neighbor_direction*hit_distance;
             let offset=hit_point-center_position.xyz;
-            if(dot(offset,offset)<1e-12 || dot(direction,normalize(offset))<PROBE_ANGLE_THRESHOLD) {continue;}
+            if((!source_probe_projection() && dot(offset,offset)<1e-12) || dot(direction,normalize(offset))<PROBE_ANGLE_THRESHOLD) {continue;}
             let neighbor_depth=max(dot(p.camera.xyz-neighbor_position.xyz,p.camera_direction.xyz),1e-6);
             let weight=pow(clamp(1.0-abs(neighbor_depth-center_depth)/center_depth,0.0,1.0),8.0);
             radiance+=weight*float4(safe_radiance(value.rgb),hit_distance);total+=weight;distance=radiance.w/total;

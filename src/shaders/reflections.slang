@@ -100,14 +100,15 @@ void prepare_primary_geometry_normals(uint3 gid:SV_DispatchThreadID) {
 #if GI_PRIMARY_GEOMETRY_NORMALS
     let pixel=gid.xy;if(!source_probe_projection()||any(pixel>=p.viewport.zw)) {return;}
     work[previous_primary_normal_address(pixel)].store(work[primary_normal_address(pixel)].load());
-    let s=surface_uncached(pixel);var packed=0u;
+    let s=surface_uncached(pixel);var packed=0u;var triangle=MISSING;
     if(s.valid) {
-        let hit_normal=trace_primary_geometry_normal(pixel,s);
+        let hit_normal=trace_primary_geometry_normal(pixel,s,triangle);
         var normal=hit_normal.xyz;
         if(hit_normal.w==0.0) {normal=depth_geometry_normal(pixel,s);}
         packed=primary_pack_geometry_normal(normal,true);
     }
     work[primary_normal_address(pixel)].store(packed);
+    work[primary_triangle_address(pixel)].store(triangle+1u);
 #endif
 }
 float reflection_plane_weight(Surface s, Surface other, float3 geometric_normal) {
@@ -160,8 +161,8 @@ void reflection_trace(uint2 pixel, Surface s, uint seed) {
         radiance = gather_directional(s, pixel, direction).rgb;
     } else {
         let normal = reflection_geometric_normal(pixel, s);
-        let origin = s.position + normal * p.cache_config.z;
-        let hit = trace(origin, direction, p.cache_config.w);
+        let origin = offset_ray_position(s.position,normal);
+        let hit = trace(origin, direction, gi_max_distance());
         radiance = source_direct_radiance(environment_radiance(direction));
         distance = reflection_miss_distance(p.restir.w);
         if (hit.triangle != MISSING) {
@@ -181,7 +182,7 @@ void reflection_trace(uint2 pixel, Surface s, uint seed) {
                     else {
                         let jitter = reflection_cache_jitter(n,hash_cell_size(position),samples);
                         var found=false;
-                        let cached=directional_cached_radiance(position+jitter,direction,hit.distance,found,cascades_active(),n);
+                        let cached=directional_cached_radiance(position+jitter,direction,hit.distance,found);
                         if (found) { radiance = cached;distance=hit.distance; }
                         else if(!source_probe_projection()) { radiance = cached_radiance(position,n,hit.distance,hit.triangle,seed,MISSING,direction); }
                     }

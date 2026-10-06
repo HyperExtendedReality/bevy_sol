@@ -186,6 +186,7 @@ fn run_source_checks(directions: u32) {
         "project_probe_atlas",
         "read_atlas_checks",
         "read_cone_checks",
+        "read_diffuse_only_target",
     ];
     let pipelines: Vec<_> = names
         .iter()
@@ -377,7 +378,9 @@ fn run_source_checks(directions: u32) {
     }
     for mode in 0..3 {
         params[52] = 7 + mode % 2;
-        params[139] = mode;
+        // Fixture scenarios must not toggle the SourceAtlas projection flag.
+        params[43] = mode;
+        params[139] = 0;
         upload(&params);
         let mut stages = vec![("clear_restir", 4), ("seed_restir_resample", 1)];
         stages.extend(scan);
@@ -406,6 +409,14 @@ fn run_source_checks(directions: u32) {
             ((rgb(0.25, 31.0) << 11) | (rgb(0.5, 63.0) << 5) | rgb(0.75, 31.0)) << 16 | 255
         );
     }
+    params[139] = 17;
+    upload(&params);
+    let data = dispatch(&[("read_diffuse_only_target", 1)]);
+    let grazing = (1.0 - (std::f64::consts::PI / 8.0).cos()).powi(5);
+    let expected = 0.96 * (1.0 - grazing).powi(2) * 1.05 / std::f64::consts::PI;
+    assert!((f64::from(f32::from_bits(data[0])) - expected).abs() < 2e-6);
+    assert!((f32::from_bits(data[1]) - std::f32::consts::FRAC_1_PI).abs() < 2e-6);
+    assert_eq!(f32::from_bits(data[2]), 0.0);
     params[51] = directions;
     params[139] = 1;
     upload(&params);

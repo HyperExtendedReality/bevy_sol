@@ -49,12 +49,6 @@ fn main() {
     let headless = quality || benchmark || std::env::args().any(|a| a == "--headless");
     let restir = std::env::args().any(|a| a == "--restir");
     let multibounce = !std::env::args().any(|a| a == "--no-multibounce");
-    let reference = restir || std::env::args().any(|a| a == "--reference");
-    let angular_resolution = std::env::args()
-        .find_map(|arg| arg.strip_prefix("--cascade-angular=").map(str::to_owned))
-        .map_or(4, |value| {
-            value.parse().expect("cascade angular resolution")
-        });
     let software = std::env::args().any(|a| a == "--software");
     let hardware = std::env::args().any(|a| a == "--hardware");
     assert!(!(software && hardware), "select a single traversal backend");
@@ -72,15 +66,7 @@ fn main() {
     } else {
         "auto"
     };
-    let mut transport = if restir {
-        "restir".to_owned()
-    } else if reference {
-        "reference".to_owned()
-    } else if angular_resolution != 4 {
-        format!("cascades{angular_resolution}")
-    } else {
-        "cascades".to_owned()
-    };
+    let mut transport = if restir { "restir" } else { "gi12" }.to_owned();
     if !multibounce {
         transport.push_str("-single-bounce");
     }
@@ -111,14 +97,6 @@ fn main() {
         })
         .add_plugins(HybridGiPlugin {
             config: HybridGiConfig {
-                radiance_cascades: if reference {
-                    None
-                } else {
-                    Some(bevy_sol::RadianceCascadesConfig {
-                        angular_resolution,
-                        ..default()
-                    })
-                },
                 reservoir_resampling: restir,
                 multibounce,
                 ray_backend,

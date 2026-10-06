@@ -1,6 +1,6 @@
 use crate::{
-    GiEnvironmentMap, GiRayBackend, GiSettings, HybridGi, environment::EnvironmentRevision,
-    raytracing::RayScene, scene::GiScene,
+    GiEnvironmentMap, GiRayBackend, GiReconstructionInputs, GiSettings, HybridGi,
+    environment::EnvironmentRevision, raytracing::RayScene, scene::GiScene,
 };
 use bevy::{
     camera::MainPassResolutionOverride,
@@ -24,14 +24,14 @@ use bevy::{
 use std::{borrow::Cow, num::NonZeroU32};
 const MATERIAL_TEXTURE_CAPACITY: u32 = 64;
 #[cfg(test)]
-#[path = "cascade_tests.rs"]
-mod cascade_tests;
-#[cfg(test)]
 #[path = "environment_tests.rs"]
 mod environment_tests;
 #[cfg(test)]
 #[path = "motion_tests.rs"]
 mod motion_tests;
+#[cfg(test)]
+#[path = "reconstruction_tests.rs"]
+mod reconstruction_tests;
 #[cfg(test)]
 #[path = "shader_tests.rs"]
 mod tests;
@@ -44,8 +44,8 @@ fn texture_features() -> WgpuFeatures {
 const CACHE_BYTES: u64 = 224;
 const RAY_BYTES: u64 = 160;
 const WORK_HEADER: u64 = 32;
-const BASE_STAGES: usize = 108;
-const STAGES: [&str; 112] = [
+const BASE_STAGES: usize = STAGES.len() - 4;
+const STAGES: [&str; 104] = [
     "compute_brdf_lut",
     "reset_work",
     "prepare_primary_geometry_normals",
@@ -88,9 +88,8 @@ const STAGES: [&str; 112] = [
     "allocate_probe_cache",
     "prepare_dispatch",
     "prepare_probe_sampling",
+    "sample_probe_directions",
     "trace_probes",
-    "prepare_cascade_probes",
-    "trace_cascade_intervals",
     "compact_primary_cells",
     "prepare_dispatch",
     "trace_cache_bounces",
@@ -116,13 +115,6 @@ const STAGES: [&str; 112] = [
     "update_hash_tiles",
     "resolve_hash_bounces",
     "resolve_cache_bounces",
-    "shade_cascade_intervals",
-    "merge_cascade_4",
-    "merge_cascade_3",
-    "merge_cascade_2",
-    "merge_cascade_1",
-    "merge_cascade_0",
-    "resolve_cascade_probes",
     "resolve_probes",
     "filter_probe_radiance_x",
     "filter_probe_radiance_y",
@@ -191,14 +183,6 @@ const SLANG_SOURCES: &[(&str, &str)] = &[
         include_str!("shaders/probe_cache.slang"),
     ),
     ("hash_grid.slang", include_str!("shaders/hash_grid.slang")),
-    (
-        "radiance_cascades.slang",
-        include_str!("shaders/radiance_cascades.slang"),
-    ),
-    (
-        "radiance_cascade_math.slang",
-        include_str!("shaders/radiance_cascade_math.slang"),
-    ),
     ("ggx.slang", include_str!("shaders/ggx.slang")),
     ("light_grid.slang", include_str!("shaders/light_grid.slang")),
     (
@@ -238,7 +222,7 @@ fn compile_shader(
                     "GI_GRID_ENVIRONMENT=1".into(),
                     "GI_SOURCE_RANDOM_BUFFER=2".into(),
                     "GI_PRIMARY_GEOMETRY_NORMALS=1".into(),
-                    "GI_RADIANCE_CASCADES=1".into(),
+                    "GI_RECONSTRUCTION_INPUTS=1".into(),
                 ],
                 ..default()
             },
@@ -272,8 +256,6 @@ struct Params {
     environment: Vec4,
     restir: UVec4,
     restir_sampling: Vec4,
-    cascades: UVec4,
-    cascade_sampling: Vec4,
 }
 #[derive(Clone, Copy, Default, ShaderType)]
 struct CompositeParams {
@@ -302,6 +284,7 @@ struct HybridShader {
 #[derive(Resource)]
 struct GpuEnvironment {
     fallback: TextureView,
+    fallback_2d: TextureView,
     view: TextureView,
     sampler: Sampler,
     rotation: Vec4,
@@ -336,6 +319,11 @@ impl FromWorld for GpuEnvironment {
             ..default()
         });
         Self {
+            fallback_2d: texture.create_view(&TextureViewDescriptor {
+                dimension: Some(TextureViewDimension::D2),
+                array_layer_count: Some(1),
+                ..default()
+            }),
             view: fallback.clone(),
             fallback,
             sampler: device.create_sampler(&SamplerDescriptor {
@@ -495,6 +483,7 @@ struct ViewGi {
     last_revision: u64,
     last_history_revision: u64,
     last_environment_revision: u64,
+    previous_reconstruction_views: Option<[TextureView; 2]>,
     last_reset: u64,
     previous_clip: Mat4,
     previous_motion_clip: Mat4,
@@ -509,7 +498,6 @@ struct ViewGi {
     reflections: Buffer,
     light_grid: Buffer,
     restir: Buffer,
-    cascades: Buffer,
     rays: Buffer,
     work: Buffer,
     indirect: Buffer,
@@ -538,6 +526,7 @@ struct ViewGi {
     next_revision: u64,
     next_history_revision: u64,
     next_environment_revision: u64,
+    next_reconstruction_views: Option<[TextureView; 2]>,
     next_motion_clip: Mat4,
     next_camera: Vec3,
     next_reset: u64,
@@ -577,9 +566,9 @@ pub(crate) fn install(app: &mut App) {
         );
         return;
     }
-    if limits.max_storage_buffers_per_shader_stage < 14
+    if limits.max_storage_buffers_per_shader_stage < 13
         || limits.max_storage_textures_per_shader_stage < 4
-        || limits.max_sampled_textures_per_shader_stage < 12
+        || limits.max_sampled_textures_per_shader_stage < 14
     {
         warn!("bevy_sol: device does not support the hybrid GI binding requirements");
         return;
@@ -593,7 +582,7 @@ pub(crate) fn install(app: &mut App) {
     let mut compute = compile_shader(compiler, "gi.slang", directions, hardware, textured);
     let bindings: Vec<_> = (0..=20)
         .chain(hardware.then_some(21))
-        .chain([24, 25, 27, 28, 29, 30, 31, 32, 33, 34, 35])
+        .chain([24, 25, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36])
         .collect();
     let mappings: Vec<_> = bindings
         .iter()
@@ -756,7 +745,12 @@ fn init_pipelines(
     entries.push(buffer_layout(25, false, 64));
     entries.push(buffer_layout(33, false, 64));
     entries.push(buffer_layout(34, true, 4));
-    entries.push(buffer_layout(35, false, 16));
+    for binding in [35, 36] {
+        entries.push(texture_layout(
+            binding,
+            TextureSampleType::Float { filterable: false },
+        ));
+    }
     entries.push(buffer_layout(27, false, 16384));
     entries.push(buffer_layout(28, false, 96));
     entries.push(buffer_layout(
@@ -1042,7 +1036,7 @@ fn allocate_view(device: &RenderDevice, size: UVec2, settings: &GiSettings) -> O
     let cached_probes = u64::from(tiles.x) * u64::from(tiles.y);
     let source_words = if c.probe_projection == crate::ProbeProjection::SourceAtlas {
         4 * u64::from(rays_count)
-            + 2 * u64::from(size.x) * u64::from(size.y)
+            + 3 * u64::from(size.x) * u64::from(size.y)
             + 5 * cached_probes
             + cached_probes.div_ceil(128)
     } else {
@@ -1070,12 +1064,11 @@ fn allocate_view(device: &RenderDevice, size: UVec2, settings: &GiSettings) -> O
         c.light_grid.bytes(),
         cached_probes * (16 + probe_bytes(c.probe_directions)),
         (u64::from(probes_count) + 2 * cached_probes) * probe_bytes(c.probe_directions),
-        if c.reservoir_resampling && c.radiance_cascades.is_none() {
+        if c.reservoir_resampling {
             c.world_space_restir.bytes(rays_count)
         } else {
             64
         },
-        c.radiance_cascades.as_ref().map_or(16, |c| c.bytes(tiles)),
     ];
     if size.x == 0
         || size.y == 0
@@ -1084,10 +1077,7 @@ fn allocate_view(device: &RenderDevice, size: UVec2, settings: &GiSettings) -> O
         || sizes
             .iter()
             .any(|&n| n > limits.max_storage_buffer_binding_size || n > limits.max_buffer_size)
-        || limits.max_storage_buffers_per_shader_stage < 14
-        || c.radiance_cascades
-            .as_ref()
-            .is_some_and(|c| c.rays(tiles) > u64::from(u32::MAX))
+        || limits.max_storage_buffers_per_shader_stage < 13
         || limits.max_storage_textures_per_shader_stage < 4
     {
         warn_once!(
@@ -1103,6 +1093,7 @@ fn allocate_view(device: &RenderDevice, size: UVec2, settings: &GiSettings) -> O
         last_revision: 0,
         last_history_revision: 0,
         last_environment_revision: 0,
+        previous_reconstruction_views: None,
         last_reset: 0,
         previous_clip: Mat4::IDENTITY,
         previous_motion_clip: Mat4::IDENTITY,
@@ -1126,7 +1117,6 @@ fn allocate_view(device: &RenderDevice, size: UVec2, settings: &GiSettings) -> O
         rays: storage(device, "bevy_sol ray work", sizes[1]),
         light_grid: storage(device, "bevy_sol streamed light grid", sizes[6]),
         restir: storage(device, "bevy_sol world-space ReSTIR", sizes[9]),
-        cascades: storage(device, "bevy_sol radiance cascade intervals", sizes[10]),
         work: storage(device, "bevy_sol compact work and dispatch", sizes[3]),
         indirect: storage(device, "bevy_sol indirect dispatch arguments", 112),
         raw_diffuse: Image::new(device, size, TextureFormat::Rgba16Float),
@@ -1154,6 +1144,7 @@ fn allocate_view(device: &RenderDevice, size: UVec2, settings: &GiSettings) -> O
         next_revision: 0,
         next_history_revision: 0,
         next_environment_revision: 0,
+        next_reconstruction_views: None,
         next_motion_clip: Mat4::IDENTITY,
         next_camera: Vec3::ZERO,
         next_reset: 0,
@@ -1167,6 +1158,7 @@ fn prepare_views(
     scene: Res<GiScene>,
     gpu: Res<GpuScene>,
     environment: Res<GpuEnvironment>,
+    images: Res<RenderAssets<GpuImage>>,
     mut random: ResMut<GpuRandom>,
     pipelines: Option<Res<Pipelines>>,
     cache: Res<PipelineCache>,
@@ -1182,6 +1174,7 @@ fn prepare_views(
         Option<&mut ViewGi>,
         Option<&TemporalJitter>,
         Option<&MainPassResolutionOverride>,
+        Option<&GiReconstructionInputs>,
     )>,
     removed: Query<Entity, (With<ViewGi>, Without<HybridGi>)>,
 ) {
@@ -1194,7 +1187,7 @@ fn prepare_views(
     if !gpu.ready {
         return;
     }
-    for (_, _, _, _, _, _, state, _, _) in views.iter_mut() {
+    for (_, _, _, _, _, _, state, _, _, _) in views.iter_mut() {
         if let Some(mut state) = state {
             state.prepared = false;
         }
@@ -1202,25 +1195,27 @@ fn prepare_views(
     let count = if settings.0.probe_projection == crate::ProbeProjection::SourceAtlas {
         views
             .iter_mut()
-            .filter_map(|(_, view, camera, prepass, gi, msaa, _, _, resolution)| {
-                let viewport = UVec2::new(view.viewport.z, view.viewport.w);
-                let size = resolution.map_or(viewport, |r| r.0);
-                if *msaa != Msaa::Off
-                    || !camera.hdr
-                    || view.target_format != TextureFormat::Rgba16Float
-                    || !gi.intensity.is_finite()
-                    || gi.intensity < 0.0
-                    || prepass.depth_view().is_none()
-                    || prepass.deferred_view().is_none()
-                    || prepass.motion_vectors_view().is_none()
-                    || size.min_element() == 0
-                    || size.x > viewport.x
-                    || size.y > viewport.y
-                {
-                    return None;
-                }
-                crate::random::seed_count(size)
-            })
+            .filter_map(
+                |(_, view, camera, prepass, gi, msaa, _, _, resolution, _)| {
+                    let viewport = UVec2::new(view.viewport.z, view.viewport.w);
+                    let size = resolution.map_or(viewport, |r| r.0);
+                    if *msaa != Msaa::Off
+                        || !camera.hdr
+                        || view.target_format != TextureFormat::Rgba16Float
+                        || !gi.intensity.is_finite()
+                        || gi.intensity < 0.0
+                        || prepass.depth_view().is_none()
+                        || prepass.deferred_view().is_none()
+                        || prepass.motion_vectors_view().is_none()
+                        || size.min_element() == 0
+                        || size.x > viewport.x
+                        || size.y > viewport.y
+                    {
+                        return None;
+                    }
+                    crate::random::seed_count(size)
+                },
+            )
             .max()
             .unwrap_or(1)
     } else {
@@ -1251,7 +1246,8 @@ fn prepare_views(
         .buffer
         .as_ref()
         .expect("initialized renderer seed table");
-    for (entity, view, camera, prepass, gi, msaa, state, jitter, resolution_override) in &mut views
+    for (entity, view, camera, prepass, gi, msaa, state, jitter, resolution_override, inputs) in
+        &mut views
     {
         if *msaa != Msaa::Off
             || !camera.hdr
@@ -1304,6 +1300,8 @@ fn prepare_views(
                 &environment,
                 random_buffer,
                 jitter,
+                inputs,
+                &images,
             );
             commands.entity(entity).insert(new);
         } else if let Some(mut state) = state {
@@ -1323,6 +1321,8 @@ fn prepare_views(
                 &environment,
                 random_buffer,
                 jitter,
+                inputs,
+                &images,
             );
         }
     }
@@ -1344,9 +1344,49 @@ fn prepare_view(
     environment: &GpuEnvironment,
     random_buffer: &Buffer,
     jitter: Option<&TemporalJitter>,
+    inputs: Option<&GiReconstructionInputs>,
+    images: &RenderAssets<GpuImage>,
 ) {
     let c = &settings.0;
     let main_viewport = UVec4::new(view.viewport.x, view.viewport.y, state.size.x, state.size.y);
+    let image_view = |handle: &Handle<bevy::prelude::Image>, channels| {
+        images.get(handle).filter(|image| {
+            let d=&image.texture_descriptor;
+            let format=image.texture_view_descriptor.as_ref().and_then(|v|v.format).unwrap_or(d.format);
+            let valid=d.dimension==TextureDimension::D2 && d.size.depth_or_array_layers==1
+                && d.sample_count==1 && d.usage.contains(TextureUsages::TEXTURE_BINDING)
+                && !format.is_srgb() && format.components()>=channels
+                && matches!(format.sample_type(None,None),Some(TextureSampleType::Float { .. }))
+                && d.size.width>=main_viewport.x.saturating_add(main_viewport.z)
+                && d.size.height>=main_viewport.y.saturating_add(main_viewport.w)
+                && image.texture_view_descriptor.as_ref().is_none_or(|v| v.base_mip_level==0
+                    && v.base_array_layer==0 && v.dimension.is_none_or(|dim| dim==TextureViewDimension::D2)
+                    && v.usage.is_none_or(|usage|usage.contains(TextureUsages::TEXTURE_BINDING)));
+            if !valid {warn_once!("bevy_sol: GiReconstructionInputs need linear float-sampled 2D images covering the camera viewport at mip zero");}
+            valid
+        }).map(|image| &image.texture_view)
+    };
+    let inputs = inputs.filter(|_| c.probe_projection == crate::ProbeProjection::SourceAtlas);
+    let occlusion = inputs.and_then(|i| image_view(&i.occlusion_and_bent_normal, 4));
+    let near_field = occlusion.and_then(|_| {
+        inputs
+            .and_then(|i| i.near_field_irradiance.as_ref())
+            .and_then(|i| image_view(i, 3))
+    });
+    let reconstruction_views = [
+        occlusion.unwrap_or(&environment.fallback_2d).clone(),
+        near_field.unwrap_or(&environment.fallback_2d).clone(),
+    ];
+    let reconstruction_changed =
+        state
+            .previous_reconstruction_views
+            .as_ref()
+            .is_none_or(|previous| {
+                previous
+                    .iter()
+                    .zip(&reconstruction_views)
+                    .any(|(a, b)| a.id() != b.id())
+            });
     let auxiliary_capacity = if c.probe_projection == crate::ProbeProjection::SourceAtlas {
         0
     } else {
@@ -1367,6 +1407,7 @@ fn prepare_view(
     let history_reset = state.frames == 0
         || state.last_history_revision != scene.history_revision
         || state.last_environment_revision != environment.revision
+        || reconstruction_changed
         || state.last_reset != gi.reset
         || state.frames == u32::MAX;
     let reset = if history_reset {
@@ -1416,17 +1457,25 @@ fn prepare_view(
             c.min_cell_size,
             c.cell_size_scale,
             c.ray_bias,
-            c.max_ray_distance,
+            if c.probe_projection == crate::ProbeProjection::SourceAtlas {
+                1e9
+            } else {
+                c.max_ray_distance
+            },
         ),
         options: UVec4::new(
             c.cache_lifetime,
             u32::from(c.multibounce),
             c.history_samples,
-            u32::from(gi.reflections),
+            u32::from(
+                gi.reflections
+                    && !(c.probe_projection == crate::ProbeProjection::SourceAtlas
+                        && c.source_disable_specular_materials),
+            ),
         ),
         quality: Vec4::new(
             c.rough_reflection_threshold,
-            f32::from(c.reservoir_resampling && c.radiance_cascades.is_none()),
+            f32::from(c.reservoir_resampling),
             f32::from(
                 c.temporal_feedback
                     && !c.multibounce
@@ -1521,7 +1570,9 @@ fn prepare_view(
                 | (u32::from(!c.source_direct_lighting) << 1)
                 | (u32::from(c.source_disable_albedo_textures) << 2)
                 | (u32::from(c.source_disable_alpha_testing) << 3)
-                | (u32::from(c.radiance_cascades.is_some()) << 4),
+                | (u32::from(c.source_disable_specular_materials) << 4)
+                | (u32::from(occlusion.is_some()) << 5)
+                | (u32::from(near_field.is_some()) << 6),
         ),
         restir_sampling: state
             .previous_camera
@@ -1536,26 +1587,6 @@ fn prepare_view(
                 .clamp(1e-6, 1.5)
                 .tan()
             }),
-        cascades: c.radiance_cascades.as_ref().map_or(UVec4::ZERO, |cascade| {
-            UVec4::new(
-                cascade.levels,
-                cascade.angular_resolution,
-                cascade.rays(state.tiles) as u32,
-                cascade
-                    .cache_queries(state.tiles, state.probes_count * c.probe_directions.pow(2))
-                    .0,
-            )
-        }),
-        cascade_sampling: c.radiance_cascades.as_ref().map_or(Vec4::ZERO, |cascade| {
-            Vec4::new(
-                cascade.first_interval,
-                cascade
-                    .cache_queries(state.tiles, state.probes_count * c.probe_directions.pow(2))
-                    .1 as f32,
-                0.0,
-                0.0,
-            )
-        }),
     });
     state.params.write_buffer(device, queue);
     let cache_matrix_offset = (WORK_HEADER
@@ -1572,10 +1603,15 @@ fn prepare_view(
         viewport: main_viewport,
         multiplier: Vec4::new(
             gi.intensity * camera.exposure,
-            f32::from(gi.reflections),
+            f32::from(
+                gi.reflections
+                    && !(c.probe_projection == crate::ProbeProjection::SourceAtlas
+                        && c.source_disable_specular_materials),
+            ),
             f32::from(c.diffuse_denoiser == crate::DiffuseDenoiser::AdaptiveSeparable),
             (u32::from(c.probe_projection == crate::ProbeProjection::SourceAtlas)
-                | (u32::from(c.source_disable_albedo_textures) << 2)) as f32,
+                | (u32::from(c.source_disable_albedo_textures) << 2)
+                | (u32::from(c.source_disable_specular_materials) << 4)) as f32,
         ),
         camera: view
             .world_from_view
@@ -1589,6 +1625,7 @@ fn prepare_view(
     state.next_revision = scene.revision;
     state.next_history_revision = scene.history_revision;
     state.next_environment_revision = environment.revision;
+    state.next_reconstruction_views = Some(reconstruction_views.clone());
     state.next_motion_clip = motion_clip;
     state.next_reset = gi.reset;
     state.prepared = true;
@@ -1696,10 +1733,12 @@ fn prepare_view(
             binding: 34,
             resource: random_buffer.as_entire_binding(),
         });
-        entries.push(BindGroupEntry {
-            binding: 35,
-            resource: state.cascades.as_entire_binding(),
-        });
+        for (binding, image) in [35, 36].into_iter().zip(&reconstruction_views) {
+            entries.push(BindGroupEntry {
+                binding,
+                resource: BindingResource::TextureView(image),
+            });
+        }
         device.create_bind_group(
             "bevy_sol compute",
             &cache.get_bind_group_layout(&pipelines.layout),
@@ -1852,6 +1891,12 @@ fn dispatch(
         }
         let reflection = &settings.0.reflection;
         let stage = STAGES[index];
+        if settings.0.probe_projection == crate::ProbeProjection::SourceAtlas
+            && settings.0.source_disable_specular_materials
+            && stage.contains("reflection")
+        {
+            continue;
+        }
         let parallel_grid = settings.0.light_grid.parallel_build
             && state.params.get().scene_info.y
                 + u32::from(
@@ -1873,6 +1918,7 @@ fn dispatch(
                 settings.0.probe_projection != crate::ProbeProjection::SourceAtlas
             }
             "prepare_primary_geometry_normals"
+            | "sample_probe_directions"
             | "scan_source_candidates"
             | "scan_source_candidate_blocks"
             | "scatter_source_candidates"
@@ -1888,27 +1934,9 @@ fn dispatch(
             "spawn_probes" => settings.0.probe_projection != crate::ProbeProjection::SourceAtlas,
             "project_probe_atlas" => {
                 settings.0.probe_projection == crate::ProbeProjection::SourceAtlas
-                    && settings.0.radiance_cascades.is_none()
-            }
-            "resolve_probes"
-            | "prepare_probe_sampling"
-            | "trace_probes"
-            | "filter_probe_radiance_x"
-            | "filter_probe_radiance_y"
-            | "filter_probes" => settings.0.radiance_cascades.is_none(),
-            name if name.contains("cascade") => {
-                settings.0.radiance_cascades.as_ref().is_some_and(|c| {
-                    !name.starts_with("merge_cascade_")
-                        || name
-                            .rsplit('_')
-                            .next()
-                            .and_then(|level| level.parse::<u32>().ok())
-                            .is_some_and(|level| level < c.levels)
-                })
             }
             name if name.contains("restir") => {
                 settings.0.reservoir_resampling
-                    && settings.0.radiance_cascades.is_none()
                     && (name != "generate_restir_bounces" || settings.0.multibounce)
             }
             name if name.starts_with("filter_probe_mask_") => {
@@ -1986,6 +2014,7 @@ fn dispatch(
             | "filter_probe_radiance_y"
             | "project_probe_atlas" => Some(112),
             "prepare_probe_sampling"
+            | "sample_probe_directions"
             | "trace_probes"
             | "populate_hash_cells"
             | "trace_hash_bounces"
@@ -2005,25 +2034,6 @@ fn dispatch(
             pass.dispatch_workgroups_indirect(&state.indirect, offset - 16);
         } else {
             let (x, y, z) = match STAGES[index] {
-                "prepare_cascade_probes" => linear(
-                    settings
-                        .0
-                        .radiance_cascades
-                        .as_ref()
-                        .unwrap()
-                        .probes(state.tiles)
-                        .max(u64::from(state.params.get().cascades.w)) as u32,
-                ),
-                "trace_cascade_intervals" | "shade_cascade_intervals" => {
-                    linear(state.params.get().cascades.z)
-                }
-                "resolve_cascade_probes" => linear(state.tiles.x * state.tiles.y),
-                name if name.starts_with("merge_cascade_") => {
-                    let level: u32 = name.rsplit('_').next().unwrap().parse().unwrap();
-                    let config = settings.0.radiance_cascades.as_ref().unwrap();
-                    let dims = config.dimensions(state.tiles, level);
-                    linear(dims.x * dims.y * config.directions(level))
-                }
                 name if name.starts_with("filter_probe_mask_") => {
                     let level: u32 = name.rsplit('_').next().unwrap().parse().unwrap();
                     let dims = (state.tiles >> level).max(UVec2::ONE);
@@ -2155,6 +2165,7 @@ fn dispatch(
     state.last_revision = state.next_revision;
     state.last_history_revision = state.next_history_revision;
     state.last_environment_revision = state.next_environment_revision;
+    state.previous_reconstruction_views = state.next_reconstruction_views.take();
     state.previous_motion_clip = state.next_motion_clip;
     state.last_reset = state.next_reset;
 }

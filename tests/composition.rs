@@ -212,7 +212,7 @@ fn source_primary_albedo_override_renders_through_production_composition() {
         usage: BufferUsages::MAP_READ | BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
-    for flags in [0u32, 1, 4, 5, 7] {
+    for flags in [0u32, 1, 4, 5, 7, 16, 17, 21] {
         for reflections in [false, true] {
             for normalize_confidence in [false, true] {
                 let mut params = [0u32; 16];
@@ -281,25 +281,46 @@ fn source_primary_albedo_override_renders_through_production_composition() {
                     .collect();
                 staging.unmap();
                 let disabled = flags & 5 == 5;
+                let diffuse_only = flags & 17 == 17;
                 let metallic = 191.0f32 / 255.0;
                 let reflectance = 128.0f32 / 255.0;
                 for channel in 0..3 {
                     let base = ([64.0f32, 128.0, 192.0][channel] / 255.0).powf(2.2);
                     let albedo = if disabled {
                         0.3
+                    } else if diffuse_only {
+                        base
                     } else {
                         base * (1.0 - metallic)
                     };
                     let f0 = if disabled {
                         0.0
                     } else {
-                        0.16 * reflectance * reflectance * (1.0 - metallic) + base * metallic
+                        let dielectric = if flags & 1 != 0 {
+                            0.04
+                        } else {
+                            0.16 * reflectance * reflectance
+                        };
+                        dielectric * (1.0 - metallic) + base * metallic
                     };
-                    let compensation = if reflections { (1.0 - f0) * 1.05 } else { 1.0 };
-                    let irradiance =
-                        [2.0, 3.0, 4.0][channel] / if normalize_confidence { 2.0 } else { 1.0 };
-                    let expected =
-                        (irradiance * albedo * compensation * 0.6 + [0.2, 0.1, 0.3][channel]) * 1.7;
+                    let compensation = if (flags & 1 != 0 || reflections) && !diffuse_only {
+                        (1.0 - f0) * 1.05
+                    } else {
+                        1.0
+                    };
+                    let irradiance = [2.0, 3.0, 4.0][channel]
+                        / if normalize_confidence { 2.0 } else { 1.0 }
+                        / if flags & 1 != 0 {
+                            std::f32::consts::PI
+                        } else {
+                            1.0
+                        };
+                    let specular = if diffuse_only {
+                        0.0
+                    } else {
+                        [0.2, 0.1, 0.3][channel]
+                    };
+                    let expected = (irradiance * albedo * compensation * 0.6 + specular) * 1.7;
                     assert!(
                         (actual[channel] - expected).abs() < 1e-5,
                         "flags {flags}, reflections {reflections}, confidence {normalize_confidence}, channel {channel}: {} != {expected}",

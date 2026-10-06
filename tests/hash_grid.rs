@@ -47,7 +47,7 @@ fn amd_hashing_half_packing_tile_mips_temporal_update_and_decay() {
     };
     let uniform = buffer(
         "hash reference params",
-        608,
+        576,
         BufferUsages::UNIFORM | BufferUsages::COPY_DST,
     );
     let work = buffer(
@@ -85,7 +85,7 @@ fn amd_hashing_half_packing_tile_mips_temporal_update_and_decay() {
         1024,
         BufferUsages::MAP_READ | BufferUsages::COPY_DST,
     );
-    let mut words = [0u32; 152];
+    let mut words = [0u32; 144];
     words[48..52].copy_from_slice(&[4, 3, 8, 8]); // Probe mask dimensions, spacing, directions
     words[58] = 24; // Reserved primary/secondary probes
     words[60] = 0.1f32.to_bits(); // Params.cache_config.x
@@ -183,22 +183,10 @@ fn amd_hashing_half_packing_tile_mips_temporal_update_and_decay() {
                     "packing.slang",
                     include_str!("../src/shaders/packing.slang"),
                 ),
-                (
-                    "radiance_cascades.slang",
-                    include_str!("../src/shaders/radiance_cascades.slang"),
-                ),
-                (
-                    "radiance_cascade_math.slang",
-                    include_str!("../src/shaders/radiance_cascade_math.slang"),
-                ),
             ],
             &bevy_slang::SlangSettings {
                 optimization: Some(2),
-                defines: vec![
-                    "GI_HARDWARE=0".into(),
-                    "GI_TEXTURED=0".into(),
-                    "GI_RADIANCE_CASCADES=1".into(),
-                ],
+                defines: vec!["GI_HARDWARE=0".into(), "GI_TEXTURED=0".into()],
                 ..default()
             },
         )
@@ -846,7 +834,7 @@ fn amd_hashing_half_packing_tile_mips_temporal_update_and_decay() {
     // Independent source RGB10 decode/normalization and l=1 cosine convolution.
     let small = 1.0_f64 / 1023.0;
     let normal_x = 1.0 / (1.0 + 2.0 * small * small).sqrt();
-    let expected = 0.4886025119029199 * normal_x * (2.0 / 3.0);
+    let expected = 0.4886025119029199 * normal_x * (2.0 * std::f64::consts::PI / 3.0);
     for (channel, scale) in [1.0, 2.0, 4.0].into_iter().enumerate() {
         assert!(
             (f64::from(f32::from_bits(values[channel])) - expected * scale).abs() < 2e-6,
@@ -854,79 +842,6 @@ fn amd_hashing_half_packing_tile_mips_temporal_update_and_decay() {
         );
     }
     assert_eq!(f32::from_bits(values[3]), 1.0);
-    let pipeline = make_pipeline("read_empty_directional_cache_test");
-    let mut encoder = device.create_command_encoder(&CommandEncoderDescriptor::default());
-    {
-        let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor::default());
-        pass.set_pipeline(&pipeline);
-        pass.set_bind_group(0, &group, &[]);
-        pass.dispatch_workgroups(1, 1, 1);
-    }
-    let values = readback(encoder);
-    assert_eq!(
-        values[0], 0,
-        "empty tile is not a populated cascade estimate"
-    );
-    assert_eq!(f32::from_bits(values[1]), 0.0);
-    assert_eq!(
-        values[2], 1,
-        "reference mode preserves tile-presence lookup"
-    );
-    assert_eq!(values[3], 1, "a valid black sample must not fall back");
-    assert_eq!(f32::from_bits(values[4]), 0.0);
-    assert_eq!(values[5], 1);
-    for (channel, sum) in [2.0, 4.0, 8.0].into_iter().enumerate() {
-        assert_eq!(f32::from_bits(values[6 + channel]), sum / 16.0);
-    }
-    assert_eq!(values[9], 0, "absent tile must fall back");
-    assert_eq!(f32::from_bits(values[10]), 0.0);
-    assert_eq!(
-        values[11], 0,
-        "indirect-only tile still needs fresh direct lighting"
-    );
-    for (channel, sum) in [2.0, 4.0, 8.0].into_iter().enumerate() {
-        assert_eq!(f32::from_bits(values[12 + channel]), sum / 16.0);
-    }
-    let pipeline = make_pipeline("read_sparse_hash_update_test");
-    for cascades in [false, true] {
-        words[139] = 1 | (u32::from(cascades) << 4);
-        queue.write_buffer(
-            &uniform,
-            0,
-            &words
-                .iter()
-                .flat_map(|v| v.to_le_bytes())
-                .collect::<Vec<_>>(),
-        );
-        let mut encoder = device.create_command_encoder(&CommandEncoderDescriptor::default());
-        {
-            let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor::default());
-            pass.set_pipeline(&pipeline);
-            pass.set_bind_group(0, &group, &[]);
-            pass.dispatch_workgroups(1, 1, 1);
-        }
-        let values = readback(encoder);
-        let expected = if cascades {
-            [2.0, 4.0, 8.0, 2.0, 0.5, 1.0, 2.0, 4.0]
-        } else {
-            [1.0, 2.0, 4.0, 1.0, 0.375, 0.75, 1.5, 3.0]
-        };
-        for (word, expected) in values[..8].iter().zip(expected) {
-            assert_eq!(
-                f32::from_bits(*word),
-                expected,
-                "empty sparse update: cascades={cascades}"
-            );
-        }
-        assert_eq!(
-            values[8..12]
-                .iter()
-                .map(|v| f32::from_bits(*v))
-                .collect::<Vec<_>>(),
-            [2.0, 4.0, 8.0, 3.0],
-            "valid black sample still lowers the estimate"
-        );
-    }
     words[139] = 1;
     words[52] = 0;
     let bytes: Vec<_> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
@@ -945,40 +860,471 @@ fn amd_hashing_half_packing_tile_mips_temporal_update_and_decay() {
         "64 concurrent first touches enqueue one tile at frame zero"
     );
     assert!(values[4..68].iter().all(|cell| *cell == values[1]));
-    let pipeline = make_pipeline("read_hash_depth_layer_test");
-    for cascades in [false, true] {
-        words[139] = 1 | (u32::from(cascades) << 4);
+    words[139] = 17; // SourceAtlas + DISABLE_SPECULAR_MATERIALS.
+    words[35] = 1.0f32.to_bits();
+    words[36..39].copy_from_slice(&[0, 0, 1.0f32.to_bits()]);
+    let bytes: Vec<_> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+    queue.write_buffer(&uniform, 0, &bytes);
+    let pipeline = make_pipeline("read_specular_override_test");
+    let mut encoder = device.create_command_encoder(&default());
+    {
+        let mut pass = encoder.begin_compute_pass(&default());
+        pass.set_pipeline(&pipeline);
+        pass.set_bind_group(0, &group, &[]);
+        pass.dispatch_workgroups(1, 1, 1);
+    }
+    let values = readback(encoder);
+    let base = [0.125f64, 0.5, 0.875];
+    let quantized = base.map(|value| (value.powf(1.0 / 2.2) * 1023.0) as u32);
+    assert_eq!(
+        values[0],
+        (quantized[0] << 20) | (quantized[1] << 10) | quantized[2]
+    );
+    let grazing = 0.5f64.powi(5);
+    let compensation = (1.0 - (0.04 + 0.96 * grazing)) * 1.05 * (1.0 - grazing);
+    for channel in 0..3 {
+        let decoded = (f64::from(quantized[channel]) / 1023.0).powf(2.2);
+        assert!((f64::from(f32::from_bits(values[1 + channel])) - decoded).abs() < 2e-6);
+        assert!((f64::from(f32::from_bits(values[4 + channel])) - compensation).abs() < 2e-6);
+        let secondary = base[channel] * 0.96 * 1.05 / std::f64::consts::PI;
+        assert!((f64::from(f32::from_bits(values[7 + channel])) - secondary).abs() < 2e-6);
+        assert_eq!(f32::from_bits(values[10 + channel]), base[channel] as f32);
+        assert_eq!(f32::from_bits(values[13 + channel]), 0.0);
+        assert_eq!(f32::from_bits(values[16 + channel]), 0.0);
+    }
+    assert_eq!(f32::from_bits(values[19]), 0.0);
+    let mut expected_rng = 73u32;
+    for _ in 0..5 {
+        expected_rng = expected_rng
+            .wrapping_mul(747796405)
+            .wrapping_add(2891336453);
+    }
+    assert_eq!(
+        values[20], expected_rng,
+        "source diffuse-only sampling consumes five PCG draws"
+    );
+    assert_eq!(f32::from_bits(values[21]), 1.0);
+    assert_eq!(f32::from_bits(values[22]), 0.0);
+    let pipeline = make_pipeline("read_material_f0_test");
+    for flags in [0, 1, 5, 17] {
+        words[139] = flags;
         queue.write_buffer(
             &uniform,
             0,
             &words
                 .iter()
-                .flat_map(|v| v.to_le_bytes())
+                .flat_map(|word| word.to_le_bytes())
                 .collect::<Vec<_>>(),
         );
-        let mut encoder = device.create_command_encoder(&CommandEncoderDescriptor::default());
+        let mut encoder = device.create_command_encoder(&default());
         {
-            let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor::default());
+            let mut pass = encoder.begin_compute_pass(&default());
             pass.set_pipeline(&pipeline);
             pass.set_bind_group(0, &group, &[]);
             pass.dispatch_workgroups(1, 1, 1);
         }
         let values = readback(encoder);
-        for pair in values[..6].as_chunks::<2>().0 {
+        for r in 0..3 {
+            let reflectance = r as f64 * 0.5;
+            let dielectric = if flags & 1 != 0 {
+                0.04
+            } else {
+                0.16 * reflectance * reflectance
+            };
+            for m in 0..3 {
+                let metallic = m as f64 * 0.5;
+                for c in 0..3 {
+                    let expected = dielectric * (1.0 - metallic) + base[c] * metallic;
+                    assert!(
+                        (f64::from(f32::from_bits(values[9 * r + 3 * m + c])) - expected).abs()
+                            < 2e-6
+                    );
+                }
+            }
+            for c in 0..3 {
+                let specular = if flags & 17 == 17 {
+                    0.0
+                } else {
+                    dielectric / 4.0
+                };
+                let expected =
+                    (base[c] * (1.0 - dielectric) * 1.05 + specular) / std::f64::consts::PI;
+                assert!(
+                    (f64::from(f32::from_bits(values[32 + 4 * r + c])) - expected).abs() < 2e-6
+                );
+            }
             assert!(
-                !pair.contains(&u32::MAX),
-                "depth fixture exhausted hash capacity"
+                (f32::from_bits(values[35 + 4 * r]) - std::f32::consts::FRAC_1_PI).abs() < 2e-6
             );
+        }
+    }
+    words[139] = 1;
+    queue.write_buffer(
+        &uniform,
+        0,
+        &words
+            .iter()
+            .flat_map(|word| word.to_le_bytes())
+            .collect::<Vec<_>>(),
+    );
+    let pipeline = make_pipeline("read_source_roughness_test");
+    let mut encoder = device.create_command_encoder(&default());
+    {
+        let mut pass = encoder.begin_compute_pass(&default());
+        pass.set_pipeline(&pipeline);
+        pass.set_bind_group(0, &group, &[]);
+        pass.dispatch_workgroups(1, 1, 1);
+    }
+    let values = readback(encoder);
+    for (i, roughness) in [0.0f64, 0.0001, 0.01, 0.0316227766, 0.1, 1.0]
+        .into_iter()
+        .enumerate()
+    {
+        let alpha = (roughness * roughness).max(1e-6);
+        let a2 = (alpha * alpha).max(1e-6);
+        let ndf = 1.0 / (std::f64::consts::PI * a2);
+        let specular = 0.04 * ndf / 4.0;
+        let k = (1.0 - alpha * alpha) / (1.0 + alpha * alpha);
+        let pdf = ndf / (2.0 * (k + 1.0));
+        assert!(
+            (f64::from(f32::from_bits(values[2 * i])) - specular).abs() < specular * 2e-7,
+            "source squared-alpha clamp at roughness {roughness}"
+        );
+        assert!(
+            (f64::from(f32::from_bits(values[2 * i + 1])) - pdf).abs() < pdf * 2e-7,
+            "source bounded-cap alpha at roughness {roughness}"
+        );
+    }
+    for (i, nv) in [0.0f64, -0.5].into_iter().enumerate() {
+        let nh = ((1.0 + nv) * 0.5).sqrt();
+        let fresnel = 0.04 + 0.96 * (1.0 - nh).powi(5);
+        let denominator = (1.0 - nh * nh) / 1.00001 + nh * nh;
+        let expected =
+            fresnel / (std::f64::consts::PI * denominator.powi(2) * (nv.abs() + 1.0) * 2.0);
+        assert!(
+            (f64::from(f32::from_bits(values[16 + i])) - expected).abs() < 2e-8,
+            "source grazing/back-facing GGX view {nv}"
+        );
+    }
+    assert_eq!(
+        f32::from_bits(values[18]),
+        0.0,
+        "source rejects below-surface half vectors"
+    );
+    assert_eq!(
+        f32::from_bits(values[19]),
+        f32::INFINITY,
+        "source bounded PDF retains the singular antipodal endpoint"
+    );
+    let pipeline = make_pipeline("read_bent_cone_test");
+    for normal in [Vec3::Z, Vec3::X, Vec3::new(1.0, 2.0, 3.0).normalize()] {
+        for ao in [-1.0f32, 0.0, 0.25, 0.75, 1.0, 2.0] {
+            words[40..44].copy_from_slice(&normal.extend(ao).to_array().map(f32::to_bits));
+            queue.write_buffer(
+                &uniform,
+                0,
+                &words
+                    .iter()
+                    .flat_map(|word| word.to_le_bytes())
+                    .collect::<Vec<_>>(),
+            );
+            let mut encoder = device.create_command_encoder(&default());
+            {
+                let mut pass = encoder.begin_compute_pass(&default());
+                pass.set_pipeline(&pipeline);
+                pass.set_bind_group(0, &group, &[]);
+                pass.dispatch_workgroups(1, 1, 1);
+            }
+            let values = readback(encoder);
+            let [x, y, z] = normal.to_array().map(f64::from);
+            let theta = (1.0 - f64::from(ao)).clamp(0.0, 1.0).sqrt().acos();
+            let (s, c) = theta.sin_cos();
+            let b1 = 1.023326707946489 * (1.0 - c.powi(3));
+            let b2 = (4.0 - 3.0 * s.powi(3)) * s * s;
+            let coefficients = [
+                0.886226925452758 * s * s,
+                -b1 * y,
+                b1 * z,
+                -b1 * x,
+                0.8580855308097834 * b2 * x * y,
+                -0.8580855308097834 * b2 * y * z,
+                0.2477079561003757 * b2 * (3.0 * z * z - 1.0),
+                -0.8580855308097834 * b2 * x * z,
+                0.4290427654048917 * b2 * (x * x - y * y),
+            ];
+            let probe = coefficients
+                .into_iter()
+                .enumerate()
+                .map(|(j, coefficient)| coefficient * (j + 1) as f64 * 0.125)
+                .sum::<f64>()
+                .max(0.0);
+            for (channel, scale) in [1.0, 2.0, 4.0].into_iter().enumerate() {
+                let expected = (0.2 + 1.75 * probe) * scale;
+                assert!(
+                    (f64::from(f32::from_bits(values[channel])) - expected).abs() < 2e-5,
+                    "bent cone {normal:?}, AO {ao}, channel {channel}"
+                );
+                assert_eq!(
+                    values[4 + channel],
+                    0,
+                    "missing probes suppress near-field GI"
+                );
+            }
+            assert_eq!(values[3], 0);
+            assert_eq!(f32::from_bits(values[7]), 1.0);
+        }
+    }
+    let run = |entries: &[(&str, u32)]| {
+        let mut encoder = device.create_command_encoder(&default());
+        for &(entry, groups) in entries {
+            let pipeline = make_pipeline(entry);
+            let mut pass = encoder.begin_compute_pass(&default());
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(0, &group, &[]);
+            pass.dispatch_workgroups(groups, 1, 1);
+        }
+        readback(encoder)
+    };
+    let upload = |words: &[u32; 144]| {
+        queue.write_buffer(
+            &uniform,
+            0,
+            &words
+                .iter()
+                .flat_map(|word| word.to_le_bytes())
+                .collect::<Vec<_>>(),
+        )
+    };
+    // IEEE binary16 expectations include signed zero, subnormals, ties-to-even,
+    // values above the former clamp and overflow. NaN payloads are backend-defined.
+    let cases = [
+        (
+            [-1.0, 60032.0, 65504.0, 65536.0],
+            [0xbc00u16, 0x7b54, 0x7bff, 0x7c00],
+        ),
+        (
+            [-65536.0, f32::INFINITY, f32::NEG_INFINITY, f32::NAN],
+            [0xfc00, 0x7c00, 0xfc00, 0x7e00],
+        ),
+        (
+            [
+                2.0f32.powi(-24),
+                2.0f32.powi(-25),
+                3.0 * 2.0f32.powi(-25),
+                -0.0,
+            ],
+            [1, 0, 2, 0x8000],
+        ),
+        (
+            [f32::NAN, 2.0, 3.0, f32::INFINITY],
+            [0x7e00, 0x4000, 0x4200, 0x7c00],
+        ),
+        (
+            [0.1237199, -0.6557197, 0.74479866, 1.0],
+            [0x2feb, 0xb93f, 0x39f5, 0x3c00],
+        ),
+    ];
+    for source in [0u32, 1] {
+        words[139] = source;
+        for (case, (input, expected)) in cases.into_iter().enumerate() {
+            words[40..44].copy_from_slice(&input.map(f32::to_bits));
+            upload(&words);
+            let values = run(&[
+                ("read_probe_half_test", 1),
+                ("read_probe_half_direction_test", 1),
+                ("read_probe_spawn_half_test", 1),
+            ]);
+            if source == 1 {
+                for (kind, packed) in values[..4].as_chunks::<2>().0.iter().enumerate() {
+                    for (channel, half) in expected.into_iter().enumerate() {
+                        let actual = (packed[channel / 2] >> (16 * (channel % 2))) as u16;
+                        if input[channel].is_nan() {
+                            assert_eq!(actual & 0x7c00, 0x7c00);
+                            assert_ne!(actual & 0x03ff, 0, "source preserves NaN");
+                        } else {
+                            assert_eq!(
+                                actual, half,
+                                "source half pack {kind}, case {case}, channel {channel}"
+                            );
+                        }
+                    }
+                }
+            } else {
+                let (radiance, sh) = match case {
+                    0 => ([0x7b53_0000, 0x7c00_7b53], [0x7b53_bc00, 0x7b53_7b53]),
+                    1 => ([0, 0xbc00_0000], [0x7b53_fb53, 0x0000_fb53]),
+                    2 => ([1, 0x8000_0002], [1, 0x8000_0002]),
+                    3 => ([0, 0x7c00_0000], [0x4000_0000, 0x7b53_4200]),
+                    _ => ([0x0000_2feb, 0x3c00_39f5], [0xb93f_2feb, 0x3c00_39f5]),
+                };
+                assert_eq!(values[..2], radiance, "compensated radiance pack {case}");
+                assert_eq!(values[2..4], sh, "compensated SH pack {case}");
+            }
+            if source == 0 {
+                for channel in 0..3 {
+                    let actual = f32::from_bits(values[4 + channel]);
+                    assert!(
+                        actual.to_bits() == input[channel].to_bits()
+                            || (actual.is_nan() && input[channel].is_nan())
+                    );
+                }
+            } else if case == 4 {
+                assert_eq!(
+                    values[4..7],
+                    [0.12371826f32, -0.6557617, 0.7446289].map(f32::to_bits),
+                    "source traces decoded half directions without renormalizing"
+                );
+            }
+            let decoded = match (source, case) {
+                (1, 0) => [-1.0, 60032.0, 65504.0, f32::INFINITY],
+                (1, 1) => [
+                    f32::NEG_INFINITY,
+                    f32::INFINITY,
+                    f32::NEG_INFINITY,
+                    f32::NAN,
+                ],
+                (1, 2) => [2.0f32.powi(-24), 0.0, 2.0f32.powi(-23), -0.0],
+                (1, 4) => [0.12371826, -0.6557617, 0.7446289, 1.0],
+                _ => input,
+            };
+            for (channel, expected) in decoded.into_iter().enumerate() {
+                let actual = f32::from_bits(values[8 + channel]);
+                assert!(
+                    actual.to_bits() == expected.to_bits()
+                        || (actual.is_nan() && expected.is_nan()),
+                    "spawn half storage boundary, source {source}, case {case}, channel {channel}: {actual} != {expected}"
+                );
+            }
+        }
+    }
+    words[62] = 0.001f32.to_bits();
+    words[63] = 1000.0f32.to_bits();
+    words[139] = 1;
+    for position in [
+        [0.0f32, -0.0, 0.001],
+        [0.031249, -0.031249, 0.03125],
+        [0.03125, -0.03125, -0.03125],
+        [1024.0, -2048.0, 65536.0],
+        [0.0001, -0.0001, -1000.0],
+    ] {
+        words[40..43].copy_from_slice(&position.map(f32::to_bits));
+        upload(&words);
+        let values = run(&[("read_source_ray_setup_test", 1)]);
+        let normal = [0.25f32, -0.5, 1.0];
+        let origin: [f32; 3] = std::array::from_fn(|c| {
+            if position[c].abs() < 1.0 / 32.0 {
+                position[c] + normal[c] / 65536.0
+            } else {
+                let step = (normal[c] * 256.0) as i32;
+                f32::from_bits(
+                    ((position[c].to_bits() as i32).wrapping_add(if position[c] < 0.0 {
+                        -step
+                    } else {
+                        step
+                    })) as u32,
+                )
+            }
+        });
+        assert_eq!(
+            values[..3],
+            origin.map(f32::to_bits),
+            "source offset at {position:?}"
+        );
+        assert_eq!(f32::from_bits(values[3]), 0.0);
+        assert_eq!(f32::from_bits(values[4]), 1e9);
+        assert_eq!(f32::from_bits(values[5]), 0.0);
+        assert_eq!(f32::from_bits(values[6]), 1.0 - 1.0 / 16384.0);
+        assert_eq!(f32::from_bits(values[7]), f32::MAX);
+        assert_eq!(
+            values[8..11],
+            std::array::from_fn::<_, 3, _>(|c| ([4.0, -3.0, 2.0][c] - origin[c]).to_bits())
+        );
+        assert_eq!(values[12..15], [0, 0, 1.0f32.to_bits()]);
+        assert_eq!(
+            values[16..20],
+            values[20..24],
+            "source quantization retains the GPU's half-infinity conversion"
+        );
+    }
+    words[32..36].fill(0);
+    words[36..39].copy_from_slice(&[0, 0, 1.0f32.to_bits()]);
+    words[44..48].copy_from_slice(&[0, 0, 32, 24]);
+    words[48..52].copy_from_slice(&[4, 3, 8, 8]);
+    words[58] = 24;
+    words[91] = 0.01f32.to_bits();
+    for source in [0u32, 1] {
+        words[139] = source;
+        for scenario in 0..5 {
+            words[52] = scenario;
+            upload(&words);
+            let values = run(&[
+                ("seed_source_filter_test", 1),
+                ("filter_probe_radiance_x", 3),
+                ("filter_probe_radiance_y", 3),
+                ("read_source_filter_test", 1),
+            ]);
+            let expected = if source == 1 || scenario == 0 || scenario == 4 {
+                2.0
+            } else {
+                1.0
+            };
+            for &channel in &values[..3] {
+                assert_eq!(
+                    f32::from_bits(channel),
+                    expected,
+                    "source {source}, filter scenario {scenario}"
+                );
+            }
+            if scenario == 0 {
+                assert_eq!(f32::from_bits(values[3]), f32::INFINITY);
+            }
+            for &channel in &values[4..7] {
+                assert_eq!(
+                    f32::from_bits(channel),
+                    if expected == 2.0 { 3.5 } else { 1.0 },
+                    "source {source}, vertical filter scenario {scenario}"
+                );
+            }
+        }
+        let values = run(&[
+            ("seed_source_sky_history_test", 1),
+            ("reproject_probe_history", 24),
+            ("read_source_sky_history_test", 1),
+        ]);
+        for &channel in &values[..3] {
             assert_eq!(
-                pair[0] == pair[1],
-                !cascades,
-                "parallel depth layers: cascades={cascades}"
+                f32::from_bits(channel),
+                if source == 1 { 0.0 } else { 3.0 },
+                "sky reprojection, source {source}"
             );
         }
         assert_eq!(
-            &values[6..9],
-            &[u32::from(!cascades); 3],
-            "opposite faces must not share cascade cache tiles"
+            f32::from_bits(values[3]),
+            if source == 1 { f32::INFINITY } else { 1000.0 }
         );
+    }
+    words[139] = 1;
+    for resident in [false, true] {
+        words[43] = f32::from(resident).to_bits();
+        upload(&words);
+        let values = run(&[("read_source_sky_predicates_test", 1)]);
+        if !resident {
+            assert_eq!(
+                values[0], 0,
+                "reprojected sky has no positive-hemisphere samples"
+            );
+        }
+        assert_eq!(
+            values[1],
+            u32::from(resident),
+            "source NaN hemisphere predicate"
+        );
+        assert_eq!(
+            values[2],
+            u32::from(resident),
+            "source tangent hemisphere predicate"
+        );
+        assert_eq!(values[3], 0);
+        assert_eq!(values[4], 1);
     }
 }

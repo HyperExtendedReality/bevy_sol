@@ -13,7 +13,7 @@ the [parity inventory](gi12-parity.md) identifies the remaining upstream mechani
 
 | Upstream mechanism | Rust/Slang implementation |
 |---|---|
-| `gi1.cpp` orchestration | `gpu.rs`: 88 scheduled base stages, including dimension-dependent mask mips, persistent-cache scans, source atlas projection and world-space reservoir passes, plus up to four optional variance-filter passes |
+| `gi1.cpp` orchestration | `gpu.rs`: 99 scheduled base stages, including dimension-dependent mask mips, persistent-cache scans, source atlas projection and world-space reservoir passes, plus up to four optional variance-filter passes |
 | Probe spawn/reproject/patch | Full/quarter/sixteenth refresh; compatible reprojected probes persist, disocclusions trace fresh, and a second slot covers incompatible surfaces |
 | Persistent probe cache | Projected candidate lists, exclusive update claims with shared history restoration, scanned free-list reservations, stable parallel LRU/MRU ordering |
 | Probe sample/populate | Equal-area hemi-octahedral directions and source tangent frame; material-weighted bounded GGX and cosine/radiance guiding, shared-memory CDF scan, uniform coverage and compensated PDF |
@@ -114,21 +114,36 @@ centres, divides RGB by the probe side length and packs the cell count in SH alp
 The optional compensated estimator excludes primary emitter hits, uses cosine
 weights for irradiance and compensated solid-angle weights for SH, and combines
 per-pixel area samples with a cosine emitter ray using power-heuristic MIS.
-Diffuse gathering applies cosine convolution to both SH projections. Analytic primary direct light
-remains Bevy's responsibility. Sharp mirrors retain traced emitter hits.
+Source diffuse gathering evaluates the source clamped-cosine SH cone using the
+shading normal or an optional bent normal. Irradiance remains in source units
+through denoising, then diffuse composition applies `1/pi`. The compensated
+estimator retains its cosine-convolved `E/pi` carrier. Analytic primary direct
+light remains Bevy's responsibility. Sharp mirrors retain traced emitter hits.
+
+The optional `GiReconstructionInputs` camera component supplies a combined
+world-space bent-normal/AO image and an optional near-field irradiance image.
+The combined RGB encodes `0.5 * normal + 0.5`; alpha zero closes the cone and
+alpha one admits the hemisphere. Near-field irradiance is added before denoising
+when the combined input and probes are valid. Missing combined inputs use the
+shading normal and AO one; missing near-field inputs contribute zero. Attachments
+must cover the camera viewport in full target coordinates, including its offset,
+and be linear float-sampled single-sampled 2D textures at mip zero. New attachment
+views reset history; changing pixel contents keeps the temporal estimator.
 
 `GiEnvironmentMap` supplies a raw six-face HDR radiance image, intensity and
 world-space rotation. Its extracted image uses a nonfiltering cube sampler, which
 also supports unfilterable RGBA32Float images. Uniform/cosine modes use the source
 hemisphere/frame transforms. Importance mode chooses a face from its coarsest
 mip luminance, descends four-child conditional distributions and applies the
-cube-plane-to-solid-angle Jacobian. PDF evaluation repeats the same descent so
-the tiny positive child floor is accounted for. An all-black map uses a finite
-uniform-sphere distribution. Importance mode requires a complete power-of-two
+cube-plane-to-solid-angle Jacobian. Source evaluated PDFs use leaf luminance and
+the face-average sum; the compensated estimator follows its clamped sampling
+hierarchy. An all-black map uses a finite uniform-sphere distribution.
+Importance mode requires a complete power-of-two
 arithmetic-average mip chain; otherwise cosine sampling remains active.
 The constant sky is included in both radiance and the importance distribution.
-Environment lighting is currently separate from streamed-grid RIS, and rays
-sample mip zero rather than transporting ray cones. Asset/config revisions and
+SourceAtlas includes the environment in streamed-grid RIS/ReSTIR and carries
+secondary ray cones for environment texture LOD. The compensated estimator
+samples the environment separately. Asset/config revisions and
 GPU readiness changes invalidate both pixel and world histories. An in-place
 image upload is detected even when Bevy reuses the texture-view ID.
 
@@ -213,29 +228,33 @@ only after all required pipelines are available.
 ## Memory and work
 
 Let `P = ceil(width/spacing) * ceil(height/spacing) * layers`, `N = directions^2`,
-and `C = cache_capacity`. Layers are two with adaptive probes, one otherwise.
+and `C = 0` for SourceAtlas, otherwise `cache_capacity`. SourceAtlas has one layer;
+the compensated estimator has two with adaptive probes, one otherwise.
 `M` is the sum of all probe-mask mip dimensions, including level zero,
 `K = ceil(width/spacing) * ceil(height/spacing)`, and `S = 80 + 16*N + 144`.
-Persistent per-view allocation, excluding Bevy targets and scene/BLAS storage:
+`Q = 4*P*N + 3*width*height + 5*K + ceil(K/128)` for SourceAtlas and zero
+otherwise. The three per-pixel work words hold current/previous geometry normals
+and the validated primary triangle. Logical per-view allocation, excluding
+uniforms, Bevy targets, shared environment/random resources and scene/BLAS storage:
 
 ```text
-2 * P * S                current/previous probes and SH
-  + K * (2*S + 16)        persistent cached probes and separate restored history
-  + P * N * 144            ray records and endpoints
-  + C * 224                auxiliary world cache and fresh reservoirs
-  + (32 + 2*P + 2*C + M + 20 + 5*K + ceil(K/128)) * 4
-                           active/fresh lists, masks, LRU scans, matrix and arguments
+(2*P + 3*K) * S + 16*K   current/previous, cached and restored probes/SH
+  + P * N * 160            ray records, endpoints and short-bounce feedback
+  + max(C,1) * 224         auxiliary cache or one fallback descriptor
+  + (32 + 2*P + 2*C + M + 24 + 10*K + ceil(K/128) + Q) * 4
+                           compaction, masks, source visibility/candidates and primary inputs
   + 112                    separate indirect arguments
-  + width*height*152       raw/temporal/spatial/geometry/moments/HDR textures
+  + width*height*168       raw/temporal/spatial/geometry/moments/HDR textures
   + hash_grid.bytes()      directional tiles, mip radiance and atomic accumulators
   + reflection.bytes()     LUT, sampled/temporal/split ratio planes
   + light_grid.bytes()     streamed bounds and light reservoirs
   + restir bytes           64-byte fallback, or world_space_restir.bytes(P*N)
 ```
 
-Default 640x640 allocation is 1,185,160,240 bytes (1.185 GB), and 1080p
-is 2,399,867,156 bytes (2.400 GB). Enabled ReSTIR adds 238,419,968 and
-797,523,968 bytes respectively over the fallback. This includes 327,680 bytes of losslessly packed
+Default SourceAtlas 640x640 allocation is 1,135,369,704 logical bytes (1.135 GB),
+and 1920x1080 is 2,078,685,436 bytes (2.079 GB). Enabled ReSTIR adds 169,607,168
+and 449,159,168 bytes respectively over the fallback. Driver allocation padding
+is excluded. This includes 327,680 bytes of losslessly packed
 source blue-noise tables in each view's reflection buffer. The default 16,384 hash buckets with 16 tiles each
 reserve 898,629,696 bytes; reducing bucket count is the main memory control.
 Configured directions determine struct sizes exactly.

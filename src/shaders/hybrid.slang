@@ -1,9 +1,6 @@
 // GI-1.2 Rust/Slang adaptation. Reference: AMD Capsaicin commit
 // 914b91596cd119eda85fbc1d3c7ee6ac391b1452, gi1.comp and hash_grid_cache.hlsl.
 // See THIRD_PARTY_NOTICES.md. Compiled to native SPIR-V with bevy_slang.
-#ifndef GI_RADIANCE_CASCADES
-#define GI_RADIANCE_CASCADES 0
-#endif
 struct Params {
     var world_from_clip: float4x4;
     var previous_clip_from_world: float4x4;
@@ -29,18 +26,7 @@ struct Params {
     var environment: float4;
     var restir: uint4;
     var restir_sampling: float4;
-#if GI_RADIANCE_CASCADES
-    var cascades: uint4;
-    var cascade_sampling: float4;
-#endif
 };
-bool cascades_active() {
-#if GI_RADIANCE_CASCADES
-    return (p.restir.w&16u)!=0u;
-#else
-    return false;
-#endif
-}
 struct Probe {
     var position: float4;
     var normal: float4;
@@ -82,6 +68,7 @@ struct RaySample {
     var bounce_normal: float4;
     var bounce_direction: float4;
     var bounce_info: uint4;
+    // Short-ray feedback into screen probes.
     var probe_bounce: float4;
 };
 [[vk::binding(0, 0)]] ConstantBuffer<Params> p;
@@ -109,6 +96,13 @@ struct RaySample {
 [[vk::binding(30, 0)]] Texture2D<float2> motion_vectors;
 [[vk::binding(31, 0)]] TextureCube<float4> environment_map;
 [[vk::binding(32, 0)]] SamplerState environment_sampler;
+#ifndef GI_RECONSTRUCTION_INPUTS
+#define GI_RECONSTRUCTION_INPUTS 0
+#endif
+#if GI_RECONSTRUCTION_INPUTS
+[[vk::binding(35, 0)]] Texture2D<float4> occlusion_and_bent_normal;
+[[vk::binding(36, 0)]] Texture2D<float4> near_field_irradiance;
+#endif
 // Rust specializes this constant to match the configured allocation exactly.
 
 static const uint WORK_HEADER = 32u;
@@ -162,19 +156,30 @@ float3 probe_irradiance(uint index, float3 n) {
     }
     return max(color, float3(0.0)); // cosine-convolved SH, divided by pi
 }
+// SH_GetCoefficients_ClampedCosine_Cone and CalculateSHIrradiance_BentCone.
+// Preserve source irradiance units through reconstruction and denoising.
+float3 probe_irradiance_bent_cone(uint index,float3 n,float ao) {
+    let theta=acos(sqrt(clamp(1.0-ao,0.0,1.0)));
+    var sine:float;var cosine:float;sincos(theta,sine,cosine);
+    let sine2=sine*sine;let sine3=sine2*sine;let cosine3=cosine*cosine*cosine;
+    let band1=1.023326707946489*(1.0-cosine3);
+    let band2=(4.0-3.0*sine3)*sine2;
+    let coefficients=float[9](0.886226925452758*sine2,-band1*n.y,band1*n.z,-band1*n.x,
+        0.8580855308097834*band2*n.x*n.y,-0.8580855308097834*band2*n.y*n.z,
+        0.2477079561003757*band2*(3.0*n.z*n.z-1.0),-0.8580855308097834*band2*n.x*n.z,
+        0.4290427654048917*band2*(n.x*n.x-n.y*n.y));
+    var value=float3(0.0);
+    for(var j=0u;j<9u;j++) {value+=coefficients[j]*probe_unpack(probes[index].filtered_sh[j]).rgb;}
+    return max(value,float3(0.0));
+}
+float diffuse_irradiance_scale() {return select(source_probe_projection(),1.0/PI,1.0);}
 uint compact_probe(uint lane) { return work[WORK_HEADER + lane].load(); }
 uint compact_primary(uint lane) { return work[WORK_HEADER + p.scene_info.z + lane].load(); }
 uint compact_cell(uint lane) { return work[WORK_HEADER + p.scene_info.z + p.frame.z + lane].load(); }
 uint transport_ray_count() {
-#if GI_RADIANCE_CASCADES
-    if(cascades_active()) {return p.cascades.w;}
-#endif
     return work[27].load()*p.screen.w*p.screen.w;
 }
 uint transport_ray_index(uint lane) {
-#if GI_RADIANCE_CASCADES
-    if(cascades_active()) {return lane;}
-#endif
     let count=p.screen.w*p.screen.w;return compact_fresh_probe(lane/count)*count+lane%count;
 }
 [shader("compute")][numthreads(1,1,1)]
@@ -235,6 +240,7 @@ float2 barycentrics(float3 position, uint t) {
 float3 material_albedo(float3 position, uint t) {
     let bary = barycentrics(position, t); let indices = geometry[t + 11u]; let properties = geometry[t + 12u];
     let base = geometry[t + 13u].rgb * material_texture(uint(indices.x), triangle_uv(t, bary, 0u)).rgb;
+    if(source_specular_materials_disabled(p.restir.w)) {return base;}
     let metallic = properties.x * material_texture(uint(indices.w), triangle_uv(t, bary, 3u)).b;
     return clamp(base * (1.0 - metallic) * (1.0 - 0.16 * properties.y * properties.y), float3(0.0), float3(0.99));
 }
@@ -325,7 +331,9 @@ Hit trace_impl_range(float3 o, float3 d, float near, float far, bool any_hit) {
     return hit;
 }
 #endif
-Hit trace_impl(float3 o,float3 d,float far,bool any_hit) {return trace_impl_range(o,d,p.cache_config.z,far,any_hit);}
+float ray_min_distance() {return select(source_probe_projection(),0.0,p.cache_config.z);}
+float gi_max_distance() {return select(source_probe_projection(),1e9,p.cache_config.w);}
+Hit trace_impl(float3 o,float3 d,float far,bool any_hit) {return trace_impl_range(o,d,ray_min_distance(),far,any_hit);}
 Hit trace(float3 o, float3 d, float far) { return trace_impl(o, d, far, false); }
 float3 geometric_normal(uint t) {
     return normalize(cross(geometry[t + 1u].xyz - geometry[t].xyz, geometry[t + 2u].xyz - geometry[t].xyz));
@@ -365,6 +373,14 @@ float3 offset_origin(float3 position, uint t, float3 toward) {
     var n = geometric_normal(t); if (dot(n, toward) < 0.0) { n = -n; }
     return position + n * p.cache_config.z;
 }
+float3 offset_ray_position(float3 position,float3 normal) {
+    if(!source_probe_projection()) {return position+normal*p.cache_config.z;}
+    // GI-1.2 offsetPosition (Ray Tracing Gems): sign-aware integer ULP offset,
+    // with an additive fallback only for components within 1/32 of the origin.
+    let int_normal=int3(normal*256.0);
+    let shifted=asfloat(asint(position)+select(position<float3(0.0),-int_normal,int_normal));
+    return select(abs(position)<float3(1.0/32.0),position+normal*(1.0/65536.0),shifted);
+}
 struct Lighting {
     var diffuse: float3;
     var specular: float3;
@@ -373,7 +389,27 @@ struct LightSample {
     var direction: float3;
     var distance: float;
     var value: float3;
+    var endpoint: float4; // xyz: sampled position or direction; w: has position.
 };
+struct ShadowRay {
+    var origin: float3;
+    var direction: float3;
+    var range: float2;
+};
+ShadowRay source_light_shadow_ray(float3 position,float3 normal,LightSample sample) {
+    let origin=offset_ray_position(position,normal);
+    return ShadowRay(origin,select(sample.endpoint.w!=0.0,sample.endpoint.xyz-origin,sample.direction),
+        float2(0.0,select(sample.endpoint.w!=0.0,1.0-1.0/16384.0,asfloat(0x7f7fffffu))));
+}
+ShadowRay light_shadow_ray(float3 position,float3 normal,uint triangle,LightSample sample) {
+    if(source_probe_projection()) {return source_light_shadow_ray(position,normal,sample);}
+    return ShadowRay(offset_origin(position,triangle,sample.direction),sample.direction,
+        float2(p.cache_config.z,max(p.cache_config.z,sample.distance-2.0*p.cache_config.z)));
+}
+Hit trace_light_shadow(float3 position,float3 normal,uint triangle,LightSample sample) {
+    let ray=light_shadow_ray(position,normal,triangle,sample);
+    return trace_impl_range(ray.origin,ray.direction,ray.range.x,ray.range.y,true);
+}
 float2 area_light_barycentrics(float2 samples) {
     // AMD sampleAreaLight/sampleAreaLightAM uses this ordering of the two
     // interpolated vertex weights. Share it between RIS and receiver MIS so
@@ -388,19 +424,21 @@ LightSample evaluate_light_cone(float3 position,float3 n,uint light_index,float2
     if(grid_environment_light(light_index)) {
         let sampled=sample_environment(n,uv);let cosine=max(dot(n,sampled.xyz),0.0);
         let value=environment_radiance_cone(sampled.xyz,solid_angle)*(cosine/max(PI*sampled.w,1e-20));
-        return LightSample(sampled.xyz,p.cache_config.w,value);
+        return LightSample(sampled.xyz,p.cache_config.w,value,float4(sampled.xyz,0.0));
     }
 #endif
     let index = light_index * 5u; let a = lights[index]; let b = lights[index + 1u];
     let c = lights[index + 2u]; let light = lights[index + 3u];
     var toward = a.xyz; var distance = p.cache_config.w; var attenuation = 1.0;
+    var endpoint=float4(a.xyz,float(light.w>=1.0));
     if (light.w >= 1.0) {
         var light_position = a.xyz;
         if (light.w >= 3.0) {
             light_position = area_light_position(a.xyz,b.xyz,c.xyz,area_light_barycentrics(uv));
         }
+        endpoint.xyz=light_position;
         let delta = light_position - position; distance = length(delta);
-        if (distance <= p.cache_config.z * 2.0) { return LightSample(n, distance, float3(0.0)); }
+        if (!(distance>0.0) || (!source_probe_projection() && distance <= p.cache_config.z * 2.0)) { return LightSample(n, distance, float3(0.0),endpoint); }
         toward = delta / distance; attenuation = 1.0 / (distance * distance);
         if (light.w >= 3.0) {
             let normal = normalize(cross(b.xyz - a.xyz, c.xyz - a.xyz));
@@ -421,7 +459,7 @@ LightSample evaluate_light_cone(float3 position,float3 n,uint light_index,float2
         emission = material_emission_cone(position,area_light_position(a.xyz,b.xyz,c.xyz,bary),triangle,solid_angle);
         if (!material_visible(triangle, bary)) { emission = float3(0.0); }
     }
-    return LightSample(toward, distance, emission * (attenuation * max(dot(n, toward), 0.0) / PI));
+    return LightSample(toward, distance, emission * (attenuation * max(dot(n, toward), 0.0) / PI),endpoint);
 }
 LightSample evaluate_light(float3 position,float3 n,uint light_index,float2 uv) {return evaluate_light_cone(position,n,light_index,uv,0.0);}
 struct Reservoir {
@@ -473,9 +511,14 @@ float mis_weight(float a, float b) {
     let ratio = b / max(a, 1e-20); return 1.0 / (1.0 + ratio * ratio);
 }
 float3 specular_brdf(float3 n, float3 view, float3 toward, float3 f0, float roughness) {
-    let nv = max(dot(n, view), 1e-4); let nl = max(dot(n, toward), 1e-4); let h = normalize(view + toward);
-    let nh = max(dot(n, h), 0.0); let vh = max(dot(view, h), 0.0);
-    let alpha = max(roughness * roughness, 1e-6); let a2 = alpha * alpha;
+    if(source_specular_materials_disabled(p.restir.w)) {return float3(0.0);}
+    let source=source_probe_projection();let h=normalize(view+toward);
+    let nv=select(source,clamp(dot(n,view),-1.0,1.0),max(dot(n,view),1e-4));
+    let nl=select(source,clamp(dot(n,toward),-1.0,1.0),max(dot(n,toward),1e-4));
+    let nh=select(source,clamp(dot(n,h),-1.0,1.0),max(dot(n,h),0.0));
+    let vh=select(source,clamp(abs(dot(view,h)),0.0,1.0),max(dot(view,h),0.0));
+    let alpha = max(roughness * roughness, 1e-6);
+    let a2=select(source_probe_projection(),max(alpha*alpha,1e-6),alpha*alpha);
     let f = f0 + (float3(1.0) - f0) * pow(1.0 - vh, 5.0);
     return f * ggx_ndf(a2, nh) / max(ggx_visibility_reciprocal(a2, nl, nv), 1e-20);
 }
@@ -670,6 +713,7 @@ struct Surface {
 #endif
 uint primary_normal_address(uint2 pixel) {return source_candidate_end()+pixel.x+pixel.y*p.viewport.z;}
 uint previous_primary_normal_address(uint2 pixel) {return primary_normal_address(pixel)+p.viewport.z*p.viewport.w;}
+uint primary_triangle_address(uint2 pixel) {return previous_primary_normal_address(pixel)+p.viewport.z*p.viewport.w;}
 uint primary_pack_geometry_normal(float3 normal,bool valid) {
     if(!valid) {return 0u;}
     let encoded=uint3(round(clamp(normal*0.5+0.5,0.0,1.0)*1023.0));
@@ -723,7 +767,18 @@ Surface surface(uint2 pixel) {
 #if GI_PRIMARY_GEOMETRY_NORMALS
     if(source_probe_projection()&&s.valid&&all(pixel<p.viewport.zw)) {
         let packed=work[primary_normal_address(pixel)].load();
-        if((packed>>30u)!=0u) {s.geometry_normal=primary_unpack_geometry_normal(packed);}
+        if((packed>>30u)!=0u) {
+            s.geometry_normal=primary_unpack_geometry_normal(packed);
+            // Bevy's orthographic depth loses precision near the camera as its
+            // far plane grows. Reuse the validated primary hit's plane to recover
+            // the visible surface before applying the source ULP ray offset.
+            let triangle=work[primary_triangle_address(pixel)].load();
+            if(p.camera.w!=0.0 && triangle!=0u) {
+                let normal=geometric_normal(triangle-1u);
+                let direction=p.camera_direction.xyz;
+                s.position-=direction*(dot(s.position-geometry[triangle-1u].xyz,normal)/dot(direction,normal));
+            }
+        }
     }
 #endif
     return s;
@@ -737,15 +792,19 @@ float4 primary_geometry_normal_from_hit(Hit hit,float3 origin,float3 direction,S
     if(dot(normal,-direction)<0.0) {normal=-normal;}
     return float4(normal,1.0);
 }
-float4 trace_primary_geometry_normal(uint2 pixel,Surface s) {
+float4 trace_primary_geometry_normal(uint2 pixel,Surface s,out uint triangle) {
+    triangle=MISSING;
     if(!s.valid||p.scene_info.x==0u) {return float4(s.normal,0.0);}
     let origin=world_position(pixel,1.0);let delta=s.position-origin;
     let distance=length(delta);
     if(distance<=p.cache_config.z) {return float4(s.normal,0.0);}
     let direction=delta/distance;
     let hit=trace(origin,direction,distance+max(p.cache_config.z*2.0,distance*1e-4));
-    return primary_geometry_normal_from_hit(hit,origin,direction,s);
+    let normal=primary_geometry_normal_from_hit(hit,origin,direction,s);
+    if(normal.w!=0.0) {triangle=hit.triangle;}
+    return normal;
 }
+float4 trace_primary_geometry_normal(uint2 pixel,Surface s) {var triangle:uint;return trace_primary_geometry_normal(pixel,s,triangle);}
 uint material_code(Surface s) {
     let base = uint3(round(clamp(s.base, float3(0.0), float3(1.0)) * 31.0));
     return 1u + (base.x | (base.y << 5u) | (base.z << 10u)
@@ -909,6 +968,28 @@ void spawn_probes(uint3 gid : SV_DispatchThreadID) {
         break;
     }
 }
+float4 sample_probe_direction(uint index,uint lane) {
+    let directions=PROBE_DIRECTIONS;let probe_index=index/directions;
+    var rng=hash32(index^hash32(p.frame.x));
+    if(source_probe_projection()) {rng=source_random(lane,p.frame.x);}
+    let packed_pixel=probes[probe_index].info.y;
+    var s=surface(uint2(packed_pixel%p.viewport.z,packed_pixel/p.viewport.z));
+    s.position=probes[probe_index].position.xyz;
+    if(source_probe_projection()) {s.geometry_normal=probes[probe_index].normal.xyz;}
+    else {s.normal=probes[probe_index].normal.xyz;}
+    return probe_sample_direction(probe_index,index%directions,s,rng);
+}
+[shader("compute")][numthreads(64,1,1)]
+void sample_probe_directions(uint3 gid:SV_DispatchThreadID) {
+    let lane=gid.x+gid.y*65536u;
+    if(lane>=work[27].load()*PROBE_DIRECTIONS) {return;}
+    let index=compact_fresh_probe(lane/PROBE_DIRECTIONS)*PROBE_DIRECTIONS+lane%PROBE_DIRECTIONS;
+    var sampled=float4(0.0);
+    if(probes[index/PROBE_DIRECTIONS].position.w!=0.0) {sampled=sample_probe_direction(index,lane);}
+    // Preserve the source SampleScreenProbes -> PopulateScreenProbes storage
+    // boundary in the existing ray record. Decoding must not renormalize.
+    rays[index].direction=float4(asfloat(probe_pack_sample(sampled.xyz)),0.0,sampled.w);
+}
 [shader("compute")][numthreads(64,1,1)]
 void trace_probes(uint3 gid : SV_DispatchThreadID) {
     let lane = gid.x + gid.y * 65536u; let directions = p.screen.w * p.screen.w;
@@ -920,17 +1001,14 @@ void trace_probes(uint3 gid : SV_DispatchThreadID) {
     rays[index].bounce_info=uint4(MISSING);
     rays[index].position = float4(0.0); rays[index].normal = float4(0.0);
     if (probe_position.w == 0.0) { return; }
-    var rng = hash32(index ^ hash32(p.frame.x));
-    if(source_probe_projection()) {rng=source_random(lane,p.frame.x);}
-    let packed_pixel=probes[probe_index].info.y;
-    var s=surface(uint2(packed_pixel%p.viewport.z,packed_pixel/p.viewport.z));
-    s.position=probe_position.xyz;
-    if(source_probe_projection()) {s.geometry_normal=normal.xyz;} else {s.normal=normal.xyz;}
-    let sampled=probe_sample_direction(probe_index,index%directions,s,rng);let ray=sampled.xyz;
+    var sampled:float4;
+    if(source_probe_projection()) {sampled=float4(probe_unpack_sample(asuint(rays[index].direction.xy)),rays[index].direction.w);}
+    else {sampled=sample_probe_direction(index,lane);}
+    let ray=sampled.xyz;
     if(sampled.w==0.0) {return;} // Below-surface GGX samples contribute zero.
     let bin=direction_bin(normal.xyz,ray);
-    let origin = probe_position.xyz + normal.xyz * p.cache_config.z;
-    let hit = trace(origin, ray, p.cache_config.w);
+    let origin = offset_ray_position(probe_position.xyz,normal.xyz);
+    let hit = trace(origin, ray, gi_max_distance());
     rays[index].direction = float4(ray, hit.distance);
     rays[index].info = uint4(MISSING, hit.triangle, bin, MISSING);
     rays[index].value.w = sampled.w;
@@ -940,7 +1018,7 @@ void trace_probes(uint3 gid : SV_DispatchThreadID) {
     let position = origin + ray * hit.distance;
     request_light_location(position);
     rays[index].position = float4(position, 1.0); rays[index].normal = float4(n, float(hit.distance < hash_cell_size(position)));
-    rays[index].info.w = hash_tile_insert(position, ray, hit.distance,n);
+    rays[index].info.w = hash_tile_insert(position, ray, hit.distance);
     if(source_probe_projection()) {
         if(rays[index].info.w==MISSING) {rays[index].info.z=MISSING;return;}
         let query=source_append_visibility(index,false);
@@ -1033,9 +1111,9 @@ void resolve_cache_bounces(uint3 gid : SV_DispatchThreadID) {
 }
 float3 cached_radiance(float3 position, float3 n, float distance, uint triangle, uint seed, uint hint, float3 direction) {
     if(source_probe_projection()) {
-        var found=false;return directional_cached_radiance(position,direction,distance,found,cascades_active(),n);
+        var found=false;return directional_cached_radiance(position,direction,distance,found);
     }
-    let cell = hash_tile_find(position, direction, distance,n);
+    let cell = hash_tile_find(position, direction, distance);
     if (cell != MISSING) {
         let value = hash_radiance(cell);
         if (value.w > 0.0) { hash_touch(cell); return value.rgb + material_emission(position, triangle); }
@@ -1073,6 +1151,11 @@ groupshared float3 probe_resolve_reflected[64];
 groupshared uint probe_resolve_bin[64];
 groupshared float4 probe_resolve_prior[64];
 groupshared uint probe_resolve_prior_bin[64];
+float4 resolved_probe_radiance(uint lane) {
+    let value=probe_resolve_radiance[lane];
+    if(source_probe_projection()) {return probe_unpack(asuint(value.xy));}
+    return value;
+}
 [shader("compute")][numthreads(64,1,1)]
 void resolve_probes(uint3 gid : SV_DispatchThreadID,uint local : SV_GroupIndex) {
     let lane=gid.x+gid.y*65536u;let bin=lane%PROBE_DIRECTIONS;let base=local-bin;
@@ -1100,7 +1183,9 @@ void resolve_probes(uint3 gid : SV_DispatchThreadID,uint local : SV_GroupIndex) 
             if(source_probe_projection()) {incoming+=r.probe_bounce.rgb;}
             var reflected=incoming;
             if(r.info.y!=MISSING) {reflected=max(incoming-material_emission(r.position.xyz,r.info.y),float3(0.0));}
-            probe_resolve_radiance[local]=float4(incoming,r.direction.w);
+            var resolved=float4(incoming,r.direction.w);
+            if(source_probe_projection()) {resolved=float4(asfloat(probe_pack(resolved)),0.0,0.0);}
+            probe_resolve_radiance[local]=resolved;
             probe_resolve_direction[local]=r.direction;probe_resolve_bin[local]=r.info.z;
             probe_resolve_reflected[local]=reflected*(r.value.w/float(PROBE_DIRECTIONS));
         }
@@ -1140,14 +1225,14 @@ void resolve_probes(uint3 gid : SV_DispatchThreadID,uint local : SV_GroupIndex) 
     var quantized=uint4(0u);var prior=float4(0.0);var current_count=0u;var prior_count=0u;
     var total_quantized=uint3(0u);var occupied=uint2(0u);
     for(var i=0u;i<PROBE_DIRECTIONS;i++) {
-        if(probe_resolve_bin[base+i]==bin) {quantized+=probe_quantize(probe_resolve_radiance[base+i]);current_count++;}
+        if(probe_resolve_bin[base+i]==bin) {quantized+=probe_quantize(resolved_probe_radiance(base+i));current_count++;}
         if(probe_resolve_prior_bin[base+i]==bin) {prior+=probe_resolve_prior[base+i];prior_count++;}
         let sampled_bin=probe_resolve_bin[base+i];
-        if(sampled_bin!=MISSING) {total_quantized+=probe_quantize(probe_resolve_radiance[base+i]).xyz;occupied[sampled_bin/32u]|=1u<<(sampled_bin%32u);}
+        if(sampled_bin!=MISSING) {total_quantized+=probe_quantize(resolved_probe_radiance(base+i)).xyz;occupied[sampled_bin/32u]|=1u<<(sampled_bin%32u);}
     }
     prior/=float(max(prior_count,1u));let current=probe_recover(quantized)/float(max(current_count,1u));
     let populated=countbits(occupied.x)+countbits(occupied.y);
-    var result=select(current_count!=0u,current,float4(probe_empty_cell_backup(float3(total_quantized)/10000.0,populated,PROBE_DIRECTIONS),p.cache_config.w));
+    var result=select(current_count!=0u,current,float4(probe_empty_cell_backup(float3(total_quantized)/10000.0,populated,PROBE_DIRECTIONS),gi_max_distance()));
     if(prior_count!=0u) {result=probe_shadow_preserving_blend(result,prior);}
     probes[index].samples[bin]=probe_pack(result);
 }
@@ -1248,11 +1333,11 @@ ProbeInterpolation source_probe_interpolation(Surface s,uint2 pixel) {
     let cell_size=select(p.camera.w!=0.0,footprint(s,pixel),length(p.camera.xyz-s.position)*p.reflection_thresholds.w);
     return probe_interpolation_weights(s,probe_interpolation_neighbors(s,pixel,cell_size),cell_size);
 }
-float4 source_diffuse_interpolation(Surface s,ProbeInterpolation interpolation) {
-    var value=float3(0.0);
-    let normal=surface_shading_normal(s);
+float4 source_diffuse_interpolation(ProbeInterpolation interpolation,float3 normal,float ao,float3 near_field) {
+    if(interpolation.indices.x==MISSING) {return float4(0.0,0.0,0.0,interpolation.hint);}
+    var value=near_field;
     for(var i=0u;i<4u;i++) {
-        if(interpolation.indices[i]!=MISSING) {value+=interpolation.weights[i]*probe_irradiance(interpolation.indices[i],normal);}
+        if(interpolation.indices[i]!=MISSING) {value+=interpolation.weights[i]*probe_irradiance_bent_cone(interpolation.indices[i],normal,ao);}
     }
     return float4(value,interpolation.hint);
 }
@@ -1267,10 +1352,17 @@ float4 source_directional_interpolation(ProbeInterpolation interpolation,float3 
     return float4(value,interpolation.hint);
 }
 float4 gather_diffuse(Surface s, uint2 pixel) {
-#if GI_RADIANCE_CASCADES
-    if(cascades_active()) {return cascade_gather_diffuse(s,pixel);}
+    if(source_probe_projection()) {
+        var normal=surface_shading_normal(s);var ao=1.0;var near_field=float3(0.0);
+#if GI_RECONSTRUCTION_INPUTS
+        if((p.restir.w&33u)==33u) {
+            let input=occlusion_and_bent_normal.Load(int3(pixel+p.viewport.xy,0));
+            normal=normalize(2.0*input.xyz-1.0);ao=input.w;
+            if((p.restir.w&64u)!=0u) {near_field=near_field_irradiance.Load(int3(pixel+p.viewport.xy,0)).rgb;}
+        }
 #endif
-    if(source_probe_projection()) {return source_diffuse_interpolation(s,source_probe_interpolation(s,pixel));}
+        return source_diffuse_interpolation(source_probe_interpolation(s,pixel),normal,ao,near_field);
+    }
     let scale=footprint(s,pixel);
     let cell_size=max(select(p.camera.w!=0.0,scale,
         length(p.camera.xyz-s.position)*p.reflection_thresholds.w),p.cache_config.z*4.0);
@@ -1323,8 +1415,9 @@ SpecularSample sample_specular(Surface s, uint seed) {
     return sample_specular_view(s, seed, view);
 }
 SpecularSample sample_specular_view(Surface s, uint seed, float3 view) {
+    if(source_specular_materials_disabled(p.restir.w)) {return SpecularSample(reflect(-view,s.normal),float3(0.0));}
     let nv = max(dot(s.normal, view), 0.0001);
-    let f0 = lerp(float3(0.16 * s.reflectance * s.reflectance), s.base, s.metallic);
+    let f0 = material_f0(s.base,s.metallic,s.reflectance,p.restir.w);
     if (s.roughness < 0.02) {
         let fresnel = f0 + (float3(1.0) - f0) * pow(1.0 - nv, 5.0);
         return SpecularSample(reflect(-view, s.normal), fresnel);
@@ -1351,13 +1444,13 @@ void resolve_pixels(uint3 gid : SV_DispatchThreadID) {
     // Filter irradiance before remodulating the receiver material in composition.
     let seed = hash32(pixel.x + pixel.y * p.viewport.z + hash32(p.frame.x));
     var view = normalize(p.camera.xyz - s.position); if (p.camera.w != 0.0) { view = p.camera_direction.xyz; }
-    let f0 = lerp(float3(0.16 * s.reflectance * s.reflectance), s.base, s.metallic);
+    let f0 = material_f0(s.base,s.metallic,s.reflectance,p.restir.w);
     var direct = Lighting(float3(0.0), float3(0.0)); var indirect = float4(0.0,0.0,0.0,1.0);
-    if (s.metallic < 0.999 && !source_probe_projection() && !cascades_active()) {
+    if (s.metallic < 0.999 && !source_probe_projection()) {
         direct = light_transport(s.position, s.normal, s.position + s.normal * p.cache_config.z,
             seed + 79u, true, float3(0.0), view, s.roughness);
     }
-    if (s.metallic < 0.999 || (p.options.w != 0u && s.roughness > p.reflection_filter.w)) { indirect = gather_diffuse(s, pixel); }
+    if (source_specular_materials_disabled(p.restir.w) || s.metallic < 0.999 || (p.options.w != 0u && s.roughness > p.reflection_filter.w)) { indirect = gather_diffuse(s, pixel); }
     let diffuse = indirect.rgb + direct.diffuse;
     let hint=select((uint(p.quality.w)&1u)!=0u,
         max(indirect.w,float(any(direct.diffuse>float3(0.0)))),1.0);
@@ -1365,9 +1458,6 @@ void resolve_pixels(uint3 gid : SV_DispatchThreadID) {
     output_specular[coord] = float4(0.0);
 }
 float4 gather_directional(Surface s, uint2 pixel, float3 direction) {
-#if GI_RADIANCE_CASCADES
-    if(cascades_active()) {return cascade_gather_directional(s,pixel,direction);}
-#endif
     if(source_probe_projection()) {return source_directional_interpolation(source_probe_interpolation(s,pixel),direction);}
     let base = int2(pixel / p.screen.z); let scale = footprint(s, pixel);
     var color = float3(0.0); var total = 0.0;
@@ -1436,7 +1526,7 @@ void filter_pixels(uint3 gid : SV_DispatchThreadID) {
     var specular=float4(0.0);
     if (p.options.w!=0u) {
         let albedo=reflection_directional_albedo(s);
-        if (s.roughness>p.reflection_filter.w) {specular=float4(diffuse.rgb*albedo,1.0);}
+        if (s.roughness>p.reflection_filter.w) {specular=float4(diffuse.rgb*diffuse_irradiance_scale()*albedo,1.0);}
         else {let reflection=reflection_load_full(2u,pixel);specular=float4(reflection.rgb/max(reflection.w,1.0)*albedo,reflection.w);}
     }
     output_diffuse[coord] = float4(safe_radiance(diffuse.rgb),diffuse.w);

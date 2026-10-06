@@ -8,10 +8,10 @@ does not establish equivalence or superiority to GI-1.2.
 The [simple checklist](gi12-checklist.md) tracks implemented mechanisms and the
 remaining completion gates, including upstream options and optional inputs.
 
-The default transport now intentionally uses [surface Radiance Cascades](radiance-cascades.md)
-instead of upstream probe reconstruction and ReSTIR reuse. The upstream estimator
-remains selectable with `radiance_cascades: None`; the inventory below records
-that reference path, not a claim that all its stages execute in cascade mode.
+The renderer follows the GI-1.2 probe/cache pipeline. World-space ReSTIR-style
+resampling reuses light reservoirs for hit shading within that pipeline;
+`reservoir_resampling` controls the optional temporal/spatial reuse.
+Exact upstream parity remains the sole completion target.
 
 | Upstream mechanism | Current executable implementation | Remaining difference |
 |---|---|---|
@@ -24,9 +24,9 @@ that reference path, not a claim that all its stages execute in cascade mode.
 | Random number generation | Renderer-owned shared MT19937 GPU seed table, deterministic seed 5489 by default, componentwise 1920x1080 minimum, retained on shrink and regenerated on growth or source option changes; modulo seed lookup, both MakeRandom overloads and source PCG draws; configurable deterministic/entropy-seeded generation; compact visibility IDs seed multibounce/fresh reservoirs, compact shadow IDs seed temporal resampling | Multiple Bevy GI views request the largest required seed count; no stratified-sampler buffer sharing; entropy uses Rust's OS-seeded hasher rather than std::random_device; atomic append order and frame-equivalent source sequences still need a matched comparison |
 | Persistent probe cache | Source LRU-driven projected candidate counts, exclusive prefix scans and ordinal scatter into contiguous per-tile lists, strict XYZ frustum rejection and normalized tile-grid projection; all scattered neighbors contribute fixed-point radiance reuse; source XYZ/packed snorm10-normal metadata, normalized decoding for ownership and reconnect frames; separate source evicted/updated atlas ownership, source LRU-prefix allocation priority, exclusive claims, old-atlas eviction into MRU and in-place radiance updates that preserve cached metadata/LRU order; compensated mode retains linked lists, shared restoration and scanned free/eviction reservations | Source geometric-normal derivation differs; cache atlas/metadata are flattened into combined records; candidate/claim atomic ordering remains unverified against an upstream frame; compensated SH temporal history remains closest-history |
 | Probe compaction | Active and fresh probe lists with separate GPU indirect counts; dense source first-hit/multibounce visibility streams and valid-reservoir shadow IDs with physical-ray mappings | Fixed-capacity storage; some dispatches use the fresh-ray upper bound and reject unused lanes; source allocates spawn queries separately |
-| Probe importance sampling | Source equal-area hemi-octahedral map/inverse/tangent frame, half-packed radiance/distance, full Fresnel layer probability, bounded GGX branch, shared-memory CDF scan and binary search; separate geometric hemisphere and shading BRDF normals; source incident-radiance atlas reconstruction without the uniform mixture; optional compensated mixture/PDF | Primary geometry-normal derivation and Bevy shading representation differ |
-| Probe radiance filtering | Fixed-point integer reuse/resolve sums, immutable reprojected neighboring atlases, source four-channel shadow-preserving hysteresis, energy-spread backup for untraced cells, first-valid mask-mip reduction, six alternating taps in each axis, endpoint angle rejection and depth weight | Flattened masks/packed arrays replace textures; far-distance quantization is guarded against half-infinity overflow |
-| Probe SH projection | Default source atlas-cell projection after directional filtering, source RGB/side-length normalization, nine signed half-packed coefficients and cell-count alpha; distinct primary geometry normals; optional compensated ray estimator | Primary normal derivation differs; sanitization guards half packing |
+| Probe importance sampling | Source equal-area hemi-octahedral map/inverse/tangent frame, half-packed radiance/distance and stored directions decoded without renormalization, full Fresnel layer probability, bounded GGX branch, shared-memory CDF scan and binary search; separate geometric hemisphere and shading BRDF normals; source incident-radiance atlas reconstruction without the uniform mixture; optional compensated mixture/PDF | Primary geometry-normal derivation and Bevy shading representation differ; CDF scan/lookup still uses an inclusive scan of half-rounded radiance instead of the source normalized exclusive scan of full-precision reuse values |
+| Probe radiance filtering | Fixed-point integer reuse/resolve sums, immutable reprojected neighboring atlases, source four-channel shadow-preserving hysteresis, energy-spread backup for untraced cells, first-valid mask-mip reduction, six alternating taps in each axis, endpoint angle rejection and depth weight | Flattened masks/packed arrays replace textures; backend-specific out-of-range float-to-uint conversion and NaN direction remapping still need matched-frame evidence |
+| Probe SH projection | Default source atlas-cell projection after directional filtering, source RGB/side-length normalization, nine signed half-packed coefficients and cell-count alpha; raw source half conversion without extra sanitation; distinct primary geometry normals; optional compensated ray estimator | Primary normal derivation differs; projection reduction order still needs upstream comparison |
 | Probe interpolation | Source original blue-noise tile jitter with geometry-normal receiver-plane acceptance, four nearest-mask/seed-relative probes, duplicate rejection, eighth-power depth/normal weights and equal-weight low-confidence backup when all weights fail; absent source probes return black with confidence one and do not queue reflection rays; rough glossy reuse shares the same four-probe weights | Primary normal derivation differs; compensated mode retains traced missing-probe fallback and a second surface layer |
 | Environment lighting | Raw HDR cubemap evaluation for misses; source virtual environment light in streamed grid/RIS/ReSTIR, oriented six-face weights, secondary ray-cone LOD, rotation, uniform/cosine hemisphere modes; source normalized face CDF with earlier-face ties, unclamped sample remapping, row-before-column probability accumulation, source complementary-probability floor and ordered Jacobian conversion; source evaluated importance PDF uses the unclamped leaf luminance/face-average sum and ceil-snapped texel lookup; compensated evaluation follows the clamped sampling hierarchy | Compensated mode samples the environment separately; black-map and exact zero-mass endpoint handling remain hardened; native scalar comparisons do not establish bitwise upstream or full-render equivalence |
 | Hash-grid radiance cache | PCG/xxHash descriptors, incoming-direction classification, distance/FOV sizing, atomic accumulation, half-float radiance, 8x8 tile mip hierarchy, sample caps and 50-frame decay; SourceAtlas uses only this cache, with no auxiliary allocation/shading fallback; compensated mode retains its auxiliary cache | Allocation contention and full source trace/update equivalence still need comparison; a dummy auxiliary descriptor remains for the shared shader layout |
@@ -41,13 +41,82 @@ that reference path, not a claim that all its stages execute in cascade mode.
 
 ## Engine boundary
 
+Source GI probe, multibounce and glossy rays use the pinned `offsetPosition`:
+256 signed integer ULP steps per normal component, with the `normal/65536`
+fallback inside `abs(position) < 1/32`. Tracing starts at TMin zero and GI
+closest-hit rays end at `1e9`. Point/spot/area shadow rays retain the sampled
+light position, use an unnormalized vector from the offset origin, and end at
+`1 - 1/16384`; directional/environment shadows end at float maximum.
+The compensated estimator retains its configurable bias/range. Engine geometry
+matching tolerances still use `ray_bias`. Orthographic cameras recover primary
+positions along their viewing ray using the validated hit triangle's plane,
+because their depth precision can otherwise place origins behind the surface.
+This reuses the existing primary query and adds one uint per target pixel.
+Primary raster/material equivalence remains a separate completion gate.
+
+Probe spawn radiance is half-packed before source fixed-point blending, and
+the source float-to-uint conversion no longer clamps hit distances. Directional
+filtering retains the source zero/infinite-distance arithmetic and normalizes
+the neighbor direction before hit reprojection. Previous-frame and cached
+reconnection require a positive hemisphere dot; resident-neighbor reuse rejects
+only negative dots, including the source distinction at zero and NaN.
+Native tests cover both filter passes, half-infinity conversion, source sky
+reprojection and those predicates. Backend-specific NaN remapping/atomic order
+and matched upstream temporal frames remain unverified.
+
+Source probe radiance and SH packing now preserve signed values, half overflow,
+infinities and NaNs as the pinned raw `packHalf4` does. Probe sample directions
+cross a separate dispatch through the existing ray record, matching the source
+`packHalf3` storage boundary; tracing and bin mapping consume the decoded
+direction without renormalization. Spawn radiance crosses packed shared storage
+before fixed-point blending. A local pack/unpack expression did not retain
+rounding on the tested GPU despite both conversion instructions appearing in
+SPIR-V; the explicit storage boundaries are covered by native checks. No ray
+buffer allocation or storage stride changes are needed.
+
+`GiReconstructionInputs` supplies the source optional `OcclusionAndBentNormal`
+and `NearFieldGlobalIllumination` attachments per camera. RGB encodes the
+world-space bent normal as `0.5 * normal + 0.5`; alpha is AO, with zero closing
+the cone and one admitting the full hemisphere. SourceAtlas uses the pinned
+clamped-cosine cone coefficients, adds near-field scene-linear irradiance before
+denoising, and applies `1/pi` during diffuse composition and rough reflection
+fallback. Missing probes suppress both contributions as upstream does.
+Without a valid combined attachment, reconstruction uses the shading normal,
+AO one and zero near-field irradiance. Missing/invalid near-field inputs alone
+supply zero. Images must be linear float-sampled, single-sampled 2D textures
+covering the full target viewport at mip zero, including its pixel offset.
+Changing attachment views/availability resets history; updating their pixel
+contents preserves temporal reconstruction. The component consumes producer
+textures; it does not implement the upstream renderer's AO/near-field producers.
+Matched producer inputs and upstream frames remain required for exact parity.
+
+SourceAtlas material BRDFs now use the pinned `MakeMaterialBRDF` dielectric
+F0 of 0.04 before metallic interpolation. Bevy reflectance remains available to
+the compensated validation estimator and Bevy's primary renderer. The shared
+material helper covers probe Fresnel selection, secondary RIS targets, hit
+shading, multibounce and final GI composition. Source composition retains
+diffuse compensation when glossy tracing is disabled; only the source
+specular-material override removes that compensation at primary pixels.
+Native checks vary metallicity and reflectance independently and verify the
+secondary BRDF, while rendered composition covers both reflection states and
+the material overrides.
+
+Source GGX evaluation clamps alpha squared to 1e-6 independently of alpha,
+as in `ClampAlphaRoughness`. The bounded PDF recomputes alpha squared for its
+sampling cap and uses the separately clamped value only for the NDF. Source
+BRDF visibility retains signed clamped dot products, Fresnel uses absolute
+dotHV, and negative dotNH rejects the NDF. The singular antipodal PDF retains
+the source positive infinity. Native checks cover zero/near-zero roughness,
+grazing and back-facing views, and that endpoint. Texture gradients and the
+primary material/raster adapters still require further parity work.
+
 Source diffuse SH evaluation now uses the normalized shading/details normal,
 while geometry normals continue to govern placement and interpolation gates.
 A native fixture with perpendicular geometry/shading normals failed before
 the correction and passes after it. This follows the pinned upstream
 [InterpolateScreenProbes receiver-normal selection](https://github.com/GPUOpen-LibrariesAndSDKs/Capsaicin/blob/914b91596cd119eda85fbc1d3c7ee6ac391b1452/src/core/src/render_techniques/gi1/gi1.comp#L1440).
 It does not resolve the separate probe-resolution-dependent SourceAtlas furnace
-failures recorded in the cascade benchmark report.
+failures tracked in the parity checklist.
 
 `source_disable_alpha_testing` maps source `DISABLE_ALPHA_TESTING` for GI
 closest-hit and shadow rays. Hardware queries use `RAY_FLAG_FORCE_OPAQUE`;
@@ -96,6 +165,19 @@ cache lighting remain available, as do world-space next-event light estimates.
 It does not disable Bevy's primary direct lighting. Enabled source glossy sky
 misses carry the source positive FP16 sky sentinel 65504; disabled misses retain
 the invalid-distance sentinel -1. Compensated mode ignores this source option.
+
+`source_disable_specular_materials` maps `gi1_disable_specular_materials` /
+`DISABLE_SPECULAR_MATERIALS` in SourceAtlas, defaulting to false. Probe sampling
+skips the specular-selection draw while retaining the source's initial two draws,
+CDF draw and two cell samples. Secondary-hit shading retains the source diffuse
+Fresnel compensation at F0 0.04, ignores metallicity and removes the specular
+BRDF. Reservoir targets normalize by diffuse albedo alone, with the source
+Lambertian fallback for zero albedo; packed materials use gamma RGB10 instead
+of RGB565 plus metallicity/roughness. GI reflection dispatches are suppressed,
+and primary GI composition uses unattenuated diffuse albedo with no specular
+input or compensation. It composes with the albedo-texture override and is
+ignored in compensated mode. Bevy's separate primary direct lighting retains
+its StandardMaterial behavior; renderer-wide material parity remains open.
 
 All source reflection trace, direction, cleanup, ratio-estimator moment/color,
 split, standard-deviation, resolved and temporal/history planes now store packed

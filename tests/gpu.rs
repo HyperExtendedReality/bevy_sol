@@ -30,6 +30,7 @@ fn offscreen_emission_and_history_invalidation() {
     let hardware = std::env::var("BEVY_SOL_TEST_HARDWARE").as_deref() == Ok("1");
     let feedback = std::env::var("BEVY_SOL_TEST_FEEDBACK").as_deref() == Ok("1");
     let disable_alpha = std::env::var("BEVY_SOL_TEST_DISABLE_ALPHA").as_deref() == Ok("1");
+    let diffuse_only = std::env::var("BEVY_SOL_TEST_DISABLE_SPECULAR").as_deref() == Ok("1");
     let blend_alpha = std::env::var("BEVY_SOL_TEST_BLEND").as_deref() == Ok("1");
     let mut wgpu = bevy::render::settings::WgpuSettings::default();
     if hardware {
@@ -56,11 +57,6 @@ fn offscreen_emission_and_history_invalidation() {
     })
     .add_plugins(HybridGiPlugin {
         config: HybridGiConfig {
-            radiance_cascades: if std::env::var("BEVY_SOL_TEST_REFERENCE").as_deref() == Ok("1") {
-                None
-            } else {
-                Some(default())
-            },
             probe_sampling: match std::env::var("BEVY_SOL_TEST_PROBE_MODE").as_deref() {
                 Ok("full") => bevy_sol::ProbeSamplingMode::FullSpp,
                 Ok("sixteenth") => bevy_sol::ProbeSamplingMode::SixteenthSpp,
@@ -97,6 +93,7 @@ fn offscreen_emission_and_history_invalidation() {
             },
             temporal_feedback: feedback,
             source_disable_alpha_testing: disable_alpha,
+            source_disable_specular_materials: diffuse_only,
             reservoir_resampling: std::env::var("BEVY_SOL_TEST_RESAMPLING").as_deref() == Ok("1"),
             multibounce: !feedback
                 && std::env::var("BEVY_SOL_TEST_NO_MULTIBOUNCE").as_deref() != Ok("1"),
@@ -635,7 +632,12 @@ fn offscreen_emission_and_history_invalidation() {
     ));
     let generation = app.world().resource::<Samples>().generation;
     pump_until(&mut app, |s| {
-        s.generation > generation + 12 && s.mean < 0.001
+        s.generation > generation + 12
+            && if diffuse_only {
+                s.mean > 0.08
+            } else {
+                s.mean < 0.001
+            }
     });
     app.world_mut()
         .get_mut::<HybridGi>(camera)
@@ -646,7 +648,7 @@ fn offscreen_emission_and_history_invalidation() {
         s.generation > generation + 20 && s.mean > 0.08
     });
     println!(
-        "Mirror receiver mean: {:.4}",
+        "Metallic receiver mean (diffuse-only={diffuse_only}): {:.4}",
         app.world().resource::<Samples>().mean
     );
     app.world_mut().get_mut::<Camera>(camera).unwrap().viewport = Some(bevy::camera::Viewport {
@@ -691,7 +693,12 @@ fn offscreen_emission_and_history_invalidation() {
         .reflections = false;
     let generation = app.world().resource::<Samples>().generation;
     pump_until(&mut app, |s| {
-        s.generation > generation + 12 && s.mean < 0.001
+        s.generation > generation + 12
+            && if diffuse_only {
+                s.mean > 0.08
+            } else {
+                s.mean < 0.001
+            }
     });
     // A plain camera must still render standard deferred materials without GI.
     app.world_mut().spawn((

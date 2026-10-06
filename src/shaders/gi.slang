@@ -9,8 +9,5 @@
 #include "ggx.slang"
 #include "light_grid.slang"
 #include "world_space_restir.slang"
-#if GI_RADIANCE_CASCADES
-#include "radiance_cascades.slang"
-#endif
 #include "reflections.slang"
 #include "gi_denoiser.slang"

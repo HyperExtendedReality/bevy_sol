@@ -1,9 +1,131 @@
 # Validation — bevy_sol 0.2
 
-Validated on **2026-10-03**, Bevy 0.19.1, Windows, NVIDIA GeForce RTX 4070 Laptop
+Validated through **2026-10-05**, Bevy 0.19.1, Windows, NVIDIA GeForce RTX 4070 Laptop
 GPU, Vulkan, wgpu 29.0.4, Slang 2026.19 and the custom `bevy_slang` crate.
 AMD reference commit: `914b91596cd119eda85fbc1d3c7ee6ac391b1452`.
 This records measured behavior, not completed upstream parity.
+
+## 2026-10-05 GI-1.2 baseline
+
+The renderer now runs the GI-1.2 screen-probe/cache pipeline as its sole transport
+architecture, including source probe sampling, filtering, SH reconstruction and
+optional world-space reservoir resampling. Exact upstream parity remains open.
+
+Validation after cleanup: all-target tests passed (23 CPU unit tests and three
+example checks), all eight production Slang variants passed storage-stride and
+uniform-offset checks, and native hash-cache and ReSTIR fixtures passed. The
+ReSTIR fixture now stores its scenario selector independently of the production
+projection flags, so its bilateral rejection case cannot change the lookup RNG.
+The rendered software probe regression with resampling enabled passed emission,
+blocking, analytic lights, scene/history edits and mirror reflection checks.
+The compensated diffuse/GGX furnace passed, including two rotated receivers.
+Formatting, clippy with warnings denied, and whitespace checks passed.
+
+The source specular-material override also has native and rendered coverage.
+Composition checks include a nonzero specular input, pure-metal albedo and the
+combined albedo override. Native checks verify gamma RGB10 reservoir packing,
+F0 0.04 secondary diffuse compensation, zero specular BRDF/sample weight and
+the five-draw PCG sequence. ReSTIR target checks pass at 4x4 and 8x8 probe
+resolutions, including black-albedo fallback and invalid-light rejection.
+The software transport regression with resampling and the specular override
+enabled passed material/history edits, emission, blocking and analytic lights.
+Its metallic receiver mean was 0.7177, with diffuse GI remaining present through
+reflection toggles, viewport changes, jitter and orthographic projection.
+These checks map the GI option; they do not establish renderer-wide or full-frame
+upstream equivalence.
+
+Native material checks now vary reflectance and metallicity independently,
+verifying source F0 0.04 across primary and secondary helpers and multibounce.
+Composition retains source diffuse compensation with glossy tracing disabled.
+GGX checks verify the separate squared-alpha floor at six roughness values,
+the bounded-cap PDF using unclamped alpha squared, signed grazing/back-facing
+visibility, below-surface half-vector rejection and the singular PDF endpoint.
+The hardware transport regression with 64-direction probes, ReSTIR resampling
+and full-resolution reflections passed; emitter/point/spot/directional receiver
+means were 0.5243/0.3933/0.3195/0.1781, and the metallic reflection receiver mean
+was 1.0. All eight production shader variants passed storage/uniform layout
+checks. Clippy with warnings denied and formatting/whitespace checks passed.
+
+## 2026-10-05 optional reconstruction inputs
+
+The `GiReconstructionInputs` camera component maps the source combined
+AO/bent-normal attachment and optional near-field irradiance. The native
+hash/probe fixture checks source SH cone coefficients against independent
+double-precision equations across three normals and six AO values, including
+out-of-range AO clamping, probe interpolation weights and the missing-probe early return.
+Source diffuse reconstruction now keeps irradiance units through denoising;
+composition and rough reflection fallback apply `1/pi` afterward.
+
+The rendered input fixture passed AO-zero suppression, bent-normal hemisphere
+selection, known near-field irradiance/exposure composition, full-target pixel
+coordinates at an offset viewport, invalid inputs and component removal.
+The production composition fixture passed both estimator unit conventions.
+All eight production shader variants passed the attachment-binding, storage
+stride and uniform-offset checks. Hardware ReSTIR transport with 64-direction
+probes and full-resolution reflections passed, with emitter/point/spot/directional
+means 0.5346/0.3955/0.3205/0.1780 and mirror mean 1.0. All-target tests passed
+(23 CPU tests and three example checks), as did clippy with warnings denied.
+These are local mechanism/regression checks. Upstream AO/near-field producers,
+identical-input frame comparisons and SourceAtlas furnace discrepancies remain
+outside this evidence.
+
+## 2026-10-05 ray setup and probe sky arithmetic
+
+SourceAtlas now uses the pinned integer/additive position offset, zero TMin and
+the `1e9` GI closest-hit range. Selected point/spot/area lights retain their
+sampled position for the source unnormalized shadow segment ending at
+`1 - 1/16384`; directional/environment shadows use float maximum. Probe spawn
+radiance is half-packed before fixed-point blending, and source distance
+quantization retains the upstream unclamped conversion.
+
+The native hash/probe fixture passed signed-zero, 1/32 boundary and large-position
+offset checks, both shadow range conventions, half-infinity conversion against
+the pinned quantizer, both directional filter passes with zero/infinite/finite
+distances, source sky reprojection and the distinct resident/reprojected predicates
+at negative, zero, positive and NaN dot products. NaN direction remapping and
+atomic ordering still require matched backend/frame evidence.
+
+The rendered regression initially exposed orthographic self-intersection: depth
+reconstruction error was larger than the source position offset. The existing
+validated primary query now retains its triangle index; orthographic surface
+positions are recovered on that plane along the viewing ray before tracing.
+This adds four bytes per pixel without another query. Hardware transport with
+64-direction probes, ReSTIR and full-resolution reflections passed after the fix,
+including viewport, jitter and orthographic changes: emitter/point/spot/directional
+means 0.5279/0.3595/0.2896/0.1512, mirror 1.0. Software 16-direction ReSTIR
+transport also passed (0.4078/0.2301/0.1745/0.0946, mirror 1.0), as did the optional
+reconstruction-input fixture and hardware native scheduling/alpha checks.
+All eight production shader variants, all-target tests (23 CPU and three example
+checks), clippy with warnings denied, formatting and whitespace checks passed.
+This is mechanism/regression evidence, not completed upstream image parity.
+
+SourceAtlas furnace checks still fail the 5% energy tolerance. With software
+traversal, the Lambertian means were 0.283511 at 4x4 directions and 0.515575 at
+8x8 directions, versus 0.416667 expected (about -32% and +24%). Both runs stop
+at the diffuse assertion before checking glossy energy. This remains an open
+resolution-dependent discrepancy; matched upstream frames are needed before
+changing the source estimator.
+
+## 2026-10-05 probe half storage boundaries
+
+Source probe radiance and SH conversion now match the raw pinned `packHalf4`
+instead of clamping/sanitizing before conversion. Native checks passed signed
+values, 60032 and 65504, half overflow, positive/negative infinity, NaNs,
+subnormals, ties-to-even and signed zero; compensated sanitation is checked
+separately. Source sample directions now cross a dedicated dispatch in the
+existing ray record and are decoded without renormalization. Spawn radiance
+crosses packed shared storage before fixed-point blending. Native checks verify
+both storage boundaries, including half rounding of a unit direction.
+
+The initial local pack/unpack expression failed the native rounding check:
+the decoded direction retained the original float values even though the emitted
+SPIR-V contained both conversions. The storage boundaries fix that observed
+failure without requiring native 16-bit arithmetic or extra buffer allocation.
+This verifies local conversion behavior; source backend NaN payload identity and
+full-frame equivalence remain unverified. The probe CDF audit also identified an
+open mismatch: the current inclusive scan uses half-rounded reuse values, while
+the source builds a normalized exclusive scan from full-precision reuse and
+selects guidance using per-cell sample counts.
 
 ## 2026-10-04 continuation
 

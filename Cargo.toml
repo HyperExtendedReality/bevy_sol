@@ -3,7 +3,7 @@ name = "bevy_sol"
 version = "0.2.0"
 edition = "2024"
 rust-version = "1.96"
-description = "GI-1.2-inspired hybrid screen probes, world radiance caching, and reflections for Bevy"
+description = "Bevy port of AMD Capsaicin GI-1.2 screen probes, radiance caching, and reflections"
 license = "MIT OR Apache-2.0"
 
 [dependencies]

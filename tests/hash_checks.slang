@@ -1,77 +1,141 @@
 #include "gi.slang"
 [[vk::binding(26, 0)]] RWStructuredBuffer<uint> checks;
+// Pinned ScreenProbes_QuantizeRadiance, retained independently for the GPU's
+// out-of-range float-to-uint behavior (including half infinity).
+uint4 reference_quantize(float4 radiance) {return uint4(round(1e4f*radiance));}
 [shader("compute")][numthreads(1,1,1)]
-void read_hash_depth_layer_test() {
-    work[3].store(0u);
-    for(var tile=0u;tile<p.hash_config.w;tile++) {
-        for(var word=0u;word<4u;word++) {hash_tiles[hash_tile_meta(tile)+word].store(0u);}
+void read_probe_half_test() {
+    let radiance=probe_pack(p.sky);let sh=probe_pack_sh(p.sky);
+    checks[0]=radiance.x;checks[1]=radiance.y;checks[2]=sh.x;checks[3]=sh.y;
+    probes[0].samples[0]=probe_pack_sample(p.sky.xyz);
+}
+[shader("compute")][numthreads(1,1,1)]
+void read_probe_half_direction_test() {
+    var direction=p.sky.xyz;
+    if(source_probe_projection()) {direction=probe_unpack_sample(probes[0].samples[0]);}
+    for(var i=0u;i<3u;i++) {checks[4u+i]=asuint(direction[i]);}
+}
+[shader("compute")][numthreads(64,1,1)]
+void read_probe_spawn_half_test(uint local:SV_GroupIndex) {
+    var value=select(local==0u,p.sky,float4(float(local)));
+    if(source_probe_projection()) {value=float4(asfloat(probe_pack(value)),0.0,0.0);}
+    probe_resolve_radiance[local]=value;
+    GroupMemoryBarrierWithGroupSync();
+    if(local==1u) {
+        let decoded=resolved_probe_radiance(local-1u);
+        for(var i=0u;i<4u;i++) {checks[8u+i]=asuint(decoded[i]);}
     }
-    let directions=float3[3](float3(1,0,0),float3(0,1,0),float3(0,0,1));
-    let origin=float3(0.01);
-    for(var axis=0u;axis<3u;axis++) {
-        work[3].store(0u);
-        for(var tile=0u;tile<p.hash_config.w;tile++) {
-            for(var word=0u;word<4u;word++) {hash_tiles[hash_tile_meta(tile)+word].store(0u);}
+}
+[shader("compute")][numthreads(1,1,1)]
+void read_source_ray_setup_test() {
+    let position=p.sky.xyz;let normal=float3(0.25,-0.5,1.0);
+    let origin=offset_ray_position(position,normal);
+    let directional=source_light_shadow_ray(position,normal,LightSample(float3(0,0,1),1e9,float3(1),float4(0,0,1,0)));
+    let positional=source_light_shadow_ray(position,normal,LightSample(float3(0,0,1),5,float3(1),float4(4,-3,2,1)));
+    for(var i=0u;i<3u;i++) {checks[i]=asuint(origin[i]);checks[8u+i]=asuint(positional.direction[i]);checks[12u+i]=asuint(directional.direction[i]);}
+    checks[3]=asuint(ray_min_distance());checks[4]=asuint(gi_max_distance());
+    checks[5]=asuint(positional.range.x);checks[6]=asuint(positional.range.y);checks[7]=asuint(directional.range.y);
+    let input=float4(1.2345,2.5678,4.125,asfloat(0x7f800000u));
+    let quantized=probe_quantize(input);let reference=reference_quantize(input);
+    for(var i=0u;i<4u;i++) {checks[16u+i]=quantized[i];checks[20u+i]=reference[i];}
+}
+[shader("compute")][numthreads(1,1,1)]
+void seed_source_filter_test() {
+    work[0].store(3u);
+    for(var i=0u;i<15u;i++) {work[probe_mask_offset(0u)+i].store(MISSING);}
+    work[probe_mask_offset(0u)+5u].store(0u);work[probe_mask_offset(0u)+6u].store(1u);work[probe_mask_offset(0u)+9u].store(2u);
+    for(var index=0u;index<3u;index++) {
+        work[WORK_HEADER+index].store(index);
+        probes[index].position=float4(0,0,-10,1);probes[index].normal=float4(0,0,1,1);
+        let seed=uint2(8u+uint(index==1u)*8u,8u+uint(index==2u)*8u);
+        probes[index].info=uint4(MISSING,seed.x+seed.y*p.viewport.z,MISSING,0u);
+        let distances=float2[5](float2(asfloat(0x7f800000u)),float2(0),float2(0,2),float2(2,0),float2(2));
+        for(var bin=0u;bin<PROBE_DIRECTIONS;bin++) {probes[index].samples[bin]=probe_pack(float4(float3(1+2*index),distances[p.frame.x][min(index,1u)]));}
+    }
+}
+[shader("compute")][numthreads(1,1,1)]
+void read_source_filter_test() {
+    let value=probe_unpack(probes[0].filtered_samples[0]);
+    let final=probe_unpack(probes[0].samples[0]);
+    for(var c=0u;c<4u;c++) {checks[c]=asuint(value[c]);checks[4u+c]=asuint(final[c]);}
+}
+[shader("compute")][numthreads(64,1,1)]
+void read_source_sky_predicates_test(uint lane:SV_GroupIndex) {
+    for(var c=0u;c<4u;c++) {probe_reuse_values[4u*lane+c]=0u;}
+    probe_reuse_counts[lane]=0u;GroupMemoryBarrierWithGroupSync();
+    probe_reuse_reconnect(0u,lane,float3(0,0,-10),float3(0,0,1),float3(0,0,-10),float3(0,0,1),
+        probe_pack(float4(3,3,3,1e9)),p.sky.w!=0.0);
+    GroupMemoryBarrierWithGroupSync();
+    if(lane==0u) {
+        var count=0u;for(var i=0u;i<PROBE_DIRECTIONS;i++) {count+=probe_reuse_counts[i];}
+        checks[0]=count;
+        checks[1]=uint(probe_reuse_hemisphere_allowed(asfloat(0x7fc00000u|p.frame.x),p.sky.w!=0.0));
+        checks[2]=uint(probe_reuse_hemisphere_allowed(0.0,p.sky.w!=0.0));
+        checks[3]=uint(probe_reuse_hemisphere_allowed(-0.5,p.sky.w!=0.0));
+        checks[4]=uint(probe_reuse_hemisphere_allowed(0.5,p.sky.w!=0.0));
+    }
+}
+[shader("compute")][numthreads(1,1,1)]
+void seed_source_sky_history_test() {
+    for(var index=0u;index<p.scene_info.z;index++) {probes[index].position=float4(0);probes[index].info=uint4(MISSING);}
+    probes[0].position=float4(0,0,-10,1);probes[0].normal=float4(0,0,1,1);probes[0].info.x=0u;
+    previous_probes[0].position=probes[0].position;previous_probes[0].normal=probes[0].normal;
+    for(var bin=0u;bin<PROBE_DIRECTIONS;bin++) {previous_probes[0].samples[bin]=probe_pack(float4(3,3,3,1e9));}
+}
+[shader("compute")][numthreads(1,1,1)]
+void read_source_sky_history_test() {
+    let value=probe_unpack(probes[0].samples[0]);
+    for(var c=0u;c<4u;c++) {checks[c]=asuint(value[c]);}
+}
+[shader("compute")][numthreads(1,1,1)]
+void read_material_f0_test() {
+    let base=float3(0.125,0.5,0.875);
+    for(var r=0u;r<3u;r++) {
+        for(var m=0u;m<3u;m++) {
+            let value=material_f0(base,float(m)*0.5,float(r)*0.5,p.restir.w);
+            for(var c=0u;c<3u;c++) {checks[9u*r+3u*m+c]=asuint(value[c]);}
         }
-        let a=hash_tile_insert(origin,directions[axis],1.0);
-        let b=hash_tile_insert(origin+directions[axis]*hash_cell_size(origin),directions[axis],1.0);
-        checks[2u*axis]=a;checks[2u*axis+1u]=b;
-        let n0=hash_tile_descriptor(origin,directions[axis],1.0,directions[axis]);
-        let n1=hash_tile_descriptor(origin,directions[axis],1.0,-directions[axis]);
-        checks[6u+axis]=uint(n0.bucket==n1.bucket&&n0.tag==n1.tag);
+        let bounce=multibounce_brdf(base,float(r)*0.5,float3(0,0,1),float3(0,0,1),float3(0,0,1));
+        for(var c=0u;c<4u;c++) {checks[32u+4u*r+c]=asuint(bounce[c]);}
     }
 }
 [shader("compute")][numthreads(1,1,1)]
-void read_sparse_hash_update_test() {
-    let cell=hash_tile_insert(float3(0.01),float3(1,0,0),1.0);
-    let tile=cell/hash_mip_count();let linear=cell%hash_mip_count();
-    let offset=uint2(linear%p.hash_config.z,linear/p.hash_config.z);
-    hash_write(cell,false,float4(2,4,8,2));hash_write(cell,true,float4(0.5,1,2,4));
-    for(var indirect=0u;indirect<2u;indirect++) {
-        let base=hash_scratch_base(tile,offset,indirect!=0u);
-        for(var i=0u;i<4u;i++) {hash_tiles[base+i].store(0u);}
-        let packed=hash_temporal_update(cell,tile,offset,indirect!=0u);
-        let value=hash_unpack(packed);
-        for(var i=0u;i<4u;i++) {checks[4u*indirect+i]=asuint(value[i]);}
+void read_source_roughness_test() {
+    let roughness=float[6](0.0,0.0001,0.01,0.0316227766,0.1,1.0);
+    for(var i=0u;i<6u;i++) {
+        let alpha=max(roughness[i]*roughness[i],1e-6);
+        let a2=max(alpha*alpha,1e-6);
+        checks[2u*i]=asuint(specular_brdf(float3(0,0,1),float3(0,0,1),float3(0,0,1),float3(0.04),roughness[i]).x);
+        checks[2u*i+1u]=asuint(ggx_bounded_pdf(alpha,a2,1.0,float3(0,0,1)));
     }
-    hash_write(cell,false,float4(2,4,8,2));
-    hash_tiles[hash_scratch_base(tile,offset,false)+3u].store(1u);
-    let black=hash_unpack(hash_temporal_update(cell,tile,offset,false));
-    for(var i=0u;i<4u;i++) {checks[8u+i]=asuint(black[i]);}
+    let views=float3[3](float3(1,0,0),float3(0.8660254038,0,-0.5),float3(0,0,-1));
+    let lights=float3[3](float3(0,0,1),float3(0,0,1),float3(0,0,-1));
+    for(var i=0u;i<3u;i++) {checks[16u+i]=asuint(specular_brdf(float3(0,0,1),views[i],lights[i],float3(0.04),1.0).x);}
+    checks[19]=asuint(ggx_bounded_pdf(1.0,1.0,1.0,float3(0,0,-1)));
 }
 [shader("compute")][numthreads(1,1,1)]
-void read_empty_directional_cache_test() {
-    let position=float3(0.01);let direction=float3(1,0,0);
-    let cell=hash_tile_insert(position,direction,1.0);
-    let tile=cell/hash_mip_count();
-    for(var mip=0u;mip<4u;mip++) {
-        if(p.hash_config.z>>mip==0u) {break;}
-        let side=p.hash_config.z>>mip;
-        for(var y=0u;y<side;y++) {for(var x=0u;x<side;x++) {
-            let address=hash_cell_index(tile,uint2(x,y),mip);
-            hash_write(address,false,float4(0.0));hash_write(address,true,float4(0.0));
-        }}
+void read_specular_override_test() {
+    let base=float3(0.125,0.5,0.875);
+    checks[0]=restir_pack_material(base);
+    let decoded=restir_material_base(checks[0]);
+    let compensation=diffuse_compensation(float3(0.1,0.4,0.9),0.5);
+    let brdf=multibounce_brdf(base,1.0,float3(0,0,1),float3(0,0,1),float3(0,0,1));
+    let albedo=primary_material_albedo(base,1.0,p.restir.w);
+    let f0=primary_material_f0(base,1.0,1.0,p.restir.w);
+    let specular=specular_brdf(float3(0,0,1),float3(0,0,1),float3(0,0,1),base,0.1);
+    for(var i=0u;i<3u;i++) {
+        checks[1u+i]=asuint(decoded[i]);checks[4u+i]=asuint(compensation[i]);
+        checks[7u+i]=asuint(brdf[i]);checks[10u+i]=asuint(albedo[i]);
+        checks[13u+i]=asuint(f0[i]);checks[16u+i]=asuint(specular[i]);
     }
-    var found=false;
-    let empty=directional_cached_radiance(position,direction,1.0,found,true);
-    checks[0]=uint(found);checks[1]=asuint(empty.x);
-    directional_cached_radiance(position,direction,1.0,found);
-    checks[2]=uint(found);
-    // A populated, genuinely black estimate must not trigger fallback.
-    hash_write(cell,false,float4(0,0,0,p.hash_sampling.x));
-    let black=directional_cached_radiance(position,direction,1.0,found,true);
-    checks[3]=uint(found);checks[4]=asuint(black.x);
-    hash_write(cell,false,float4(2,4,8,p.hash_sampling.x));
-    let lit=directional_cached_radiance(position,direction,1.0,found,true);
-    checks[5]=uint(found);
-    for(var channel=0u;channel<3u;channel++) {checks[6u+channel]=asuint(lit[channel]);}
-    let absent=directional_cached_radiance(position+float3(100,200,300),direction,1.0,found,true);
-    checks[9]=uint(found);checks[10]=asuint(absent.x);
-    hash_write(cell,false,float4(0.0));
-    hash_write(cell,true,float4(2,4,8,p.hash_sampling.y));
-    let indirect_only=directional_cached_radiance(position,direction,1.0,found,true);
-    checks[11]=uint(found);
-    for(var channel=0u;channel<3u;channel++) {checks[12u+channel]=asuint(indirect_only[channel]);}
+    checks[19]=asuint(brdf_specular_probability(base,0.5,float3(0.0)));
+    // No reused cells: the source retains this cell's stratification.
+    probes[0].filtered_samples[0]=uint2(0u);probes[0].samples[0]=uint2(0u);
+    let surface=Surface(float3(0.0),float3(0,0,1),base,0.1,1.0,1.0,1.0,true,float3(0,0,1));
+    var rng=73u;let direction=probe_sample_direction(0u,0u,surface,rng);
+    checks[20]=rng;checks[21]=asuint(direction.w);
+    let sample=sample_specular_view(surface,73u,float3(0,0,1));
+    checks[22]=asuint(length(sample.weight));
 }
 [shader("compute")][numthreads(1,1,1)]
 void read_source_diffuse_normal_test() {
@@ -79,7 +143,7 @@ void read_source_diffuse_normal_test() {
     probes[0].filtered_sh[3]=probe_pack_sh(float4(-1.0,-2.0,-4.0,1.0));
     let receiver=Surface(float3(0.0),float3(1,0,0),float3(0.5),1.0,0.0,0.5,1.0,true,float3(0,0,1));
     let interpolation=ProbeInterpolation(uint4(0u,MISSING,MISSING,MISSING),float4(1,0,0,0),1.0);
-    let value=source_diffuse_interpolation(receiver,interpolation);
+    let value=source_diffuse_interpolation(interpolation,surface_shading_normal(receiver),1.0,float3(0.0));
     for(var i=0u;i<4u;i++) {checks[i]=asuint(value[i]);}
 }
 [shader("compute")][numthreads(1,1,1)]
@@ -287,4 +351,19 @@ void concurrent_hash_claim_test(uint lane:SV_GroupIndex) {
     checks[4u+lane]=hash_tile_insert(float3(0.01),float3(1,0,0),1.0);
     GroupMemoryBarrierWithGroupSync();
     if(lane==0u) {checks[0]=work[3].load();checks[1]=hash_cell_index(first,desc.offset,0u);}
+}
+[shader("compute")][numthreads(1,1,1)]
+void read_bent_cone_test() {
+    for (var index=0u;index<2u;index++) {
+        for (var j=0u;j<9u;j++) {
+            probes[index].filtered_sh[j]=probe_pack_sh(float4(float3(1,2,4)*float((index+1u)*(j+1u))*0.125,1));
+        }
+    }
+    ProbeInterpolation interpolation;
+    interpolation.indices=uint4(0u,1u,MISSING,MISSING);
+    interpolation.weights=float4(0.25,0.75,0,0);interpolation.hint=0;
+    let value=source_diffuse_interpolation(interpolation,normalize(p.sky.xyz),p.sky.w,float3(0.2,0.4,0.8));
+    interpolation.indices=uint4(MISSING);interpolation.weights=float4(0);interpolation.hint=1;
+    let missing=source_diffuse_interpolation(interpolation,float3(0,0,1),1,float3(100));
+    for (var i=0u;i<4u;i++) {checks[i]=asuint(value[i]);checks[4u+i]=asuint(missing[i]);}
 }

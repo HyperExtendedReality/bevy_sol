@@ -1,24 +1,31 @@
 # bevy_sol
 
-**GI-1.2-inspired hybrid global illumination for Bevy 0.19.1.** Rust prepares the
+**A Bevy 0.19.1 port of AMD Capsaicin GI-1.2, targeting 1:1 algorithm parity.** Rust prepares the
 scene, manages GPU resources, and integrates the renderer. The custom `bevy_slang`
 crate compiles embedded Slang modules to native SPIR-V. Shaders use Vulkan
 hardware ray queries or a software triangle BVH, combine screen probes with a world radiance cache, and reconstruct
 diffuse lighting and glossy reflections. Bevy continues to render direct lights.
 
-This is an experimental adaptation of the architecture in AMD's
+The implementation follows AMD's
 [Capsaicin GI-1.2 source](https://github.com/GPUOpen-LibrariesAndSDKs/Capsaicin/tree/914b91596cd119eda85fbc1d3c7ee6ac391b1452/src/core/src/render_techniques/gi1).
 It is not a complete port or a claim of equivalent performance or image quality.
 The [source mapping and architecture](docs/hybrid-gi.md) explain the differences.
 AMD's license is preserved in [third-party notices](THIRD_PARTY_NOTICES.md).
 
-## Radiance Cascades Transport
+## GI-1.2 transport
 
-The default configuration uses surface Radiance Cascades with world-space tracing
-and retains the screen-space and persistent world-space radiance caches.
-ReSTIR reuse is disabled on this path. See [architecture and acceptance status](docs/radiance-cascades.md).
-The GI-1.2 reference estimator remains available with `radiance_cascades: None`
-for matched comparisons. Better performance and quality are not yet established.
+Screen probes trace and retain directional samples, reconstruct diffuse lighting
+through spherical harmonics, and supply rough reflections. A persistent tiled
+world-space radiance cache supports probe-hit shading and multibounce transport.
+GI-1.2 uses reservoir importance sampling for lighting at those hits, with optional
+ReSTIR-style temporal/spatial resampling of light reservoirs in world space.
+`reservoir_resampling` enables that reuse; it improves the probes' sample gathering
+without replacing their transport or reconstruction. Fresh eight-candidate RIS
+remains active when reuse is disabled, matching the pinned upstream default.
+
+The sole algorithm target is a 1:1 GI-1.2 port. Existing compensated estimators
+and alternative denoisers are validation options; the [parity checklist](docs/gi12-checklist.md)
+tracks the remaining work before the port can claim equivalence.
 
 ## Use
 
@@ -57,6 +64,9 @@ plugin initialization, with only the selected tracing/material specialization.
 The dependency currently uses the sibling `../bevy_slang` checkout.
 
 `HybridGiConfig` configures allocation and sampling when the plugin is added.
+SourceAtlas uses GI-1.2's position offset, zero ray TMin and fixed `1e9` GI range;
+`max_ray_distance` and the tracing use of `ray_bias` configure the compensated
+validation estimator. Engine geometry matching tolerances still use `ray_bias`.
 `HybridGi` controls intensity and reflections per camera. Increase `reset` on
 camera cuts. Perspective/orthographic projections and Bevy's temporal jitter are
 handled. Resize/viewport changes allocate fresh history; material, topology,
@@ -68,7 +78,7 @@ secondary-ray geometry and emissive sampling while letting it receive GI.
 
 The library leaves window/platform setup to the application. Vulkan with
 `WgpuFeatures::PASSTHROUGH_SHADERS`, thirteen storage buffers, four storage textures,
-and twelve sampled textures per stage is required. Bevy's default functionality
+and fourteen sampled textures per stage is required. Bevy's default functionality
 settings enable available adapter features; custom `WgpuSettings` must enable
 passthrough explicitly. These trusted application shaders bypass Naga's importer;
 Slang validates emitted SPIR-V. Sparse bindings are relocated by `bevy_slang` to
@@ -156,10 +166,17 @@ Bevy's preconvolved `EnvironmentMapLight` images. GI does not draw the skybox.
   radii 3/2 and cleanup radii 2/1 respectively.
   `source_direct_lighting` maps GI-1.2's sky/emissive injection and probe-feedback
   option in SourceAtlas, while retaining reflected indirect cache lighting.
+  `source_disable_specular_materials` maps GI-1.2's diffuse-only material option:
+  metallicity is ignored for GI, probe rays use diffuse sampling, reservoir
+  materials use RGB10, and GI reflections are disabled. Secondary diffuse
+  compensation is retained; Bevy's primary direct lighting remains separate.
 - Spatial probe filtering and demodulated irradiance reconstruction. The default
   diffuse denoiser uses GI-1.2's nine-tap reprojection, smoothed color delta,
   adaptive/vignetted history cap and two separable disocclusion-blur passes.
   A variance-clipped temporal/à-trous mode remains selectable.
+- Optional `GiReconstructionInputs` camera attachments supply GI-1.2's packed
+  world-space bent normals/AO and near-field irradiance. SourceAtlas preserves
+  irradiance units through denoising and applies the Lambertian `1/pi` in composition.
 - Depth/normal-aware diffuse gathering;
   disoccluded surfaces without suitable probes get a traced fallback sample.
 - Secondary base-color/emissive/metallic-roughness textures, UV channels and
@@ -279,10 +296,4 @@ hardware scene, and retains SourceAtlas world/persistent-probe caches across
 pose-only updates. Compensated mode resets those caches; motion vectors preserve
 compatible pixel and screen-probe histories in both modes. Correct animated geometry is
 tested; stable temporal lighting and large animated scenes still need further work.
-The historical Radiance
-Cascades assessment remains in [techniques.md](docs/techniques.md).
-
-Version 0.2 replaces the historical `RadianceCascadesPlugin` and fixed
-`IrradianceVolume` API with `HybridGiPlugin`/`HybridGiConfig` and camera `HybridGi`.
-The new `RadianceCascadesConfig` controls surface-cascade intervals and angular
-resolution, not the historical fixed-volume implementation. There is no fixed GI domain.
+There is no fixed GI domain; histories and caches belong to each camera.
